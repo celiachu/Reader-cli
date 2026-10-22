@@ -94,6 +94,7 @@ pub(crate) struct AgentLayout {
 }
 
 impl AgentLayout {
+    #[allow(dead_code)]
     pub fn new(area: Rect, configured_width: Option<u16>) -> Self {
         Self::with_options(area, configured_width, None)
     }

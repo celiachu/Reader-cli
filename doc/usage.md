@@ -72,6 +72,7 @@ requests removal of the book file, subject to the managed-folder checks in
 | `M` | Show book information |
 | `s` | Show or hide reading progress |
 | `p` | Toggle Agent Terminal Mode (legacy Discreet Mode) |
+| `C` | Cycle skin/theme (Sepia, E-ink, Nord, Forest, Dracula, Rose, Solarized, Terminal) |
 | `F12` | Fold reading output / return |
 | `?` / `F1` | Show available shortcuts |
 | `q` / `Ctrl+C` | Save and quit |
@@ -143,6 +144,7 @@ missing-file status. After a launched reader quits, you return to the shelf.
 | `w` | Cycle view filter (all / local / cloud) or connect network |
 | `R` | Sync network bookshelf |
 | `d` | Start removal of the selected book with confirmation |
+| `C` | Cycle skin/theme (Sepia, E-ink, Nord, Forest, Dracula, Rose, Solarized, Terminal) |
 | `?` / `F1` | Show shelf help |
 | `q` / `Esc` / `Ctrl+C` | Quit |
 

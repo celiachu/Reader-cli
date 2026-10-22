@@ -13,15 +13,11 @@ use crate::ui::{centered_rect, fill_background, help_lines, hud_chunks, Palette}
 
 pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, state: &ReaderState) {
     let palette = if state.config.discreet_mode {
-        Palette::terminal().discreet_mode()
+        Palette::for_reading_theme(state.config.reading_theme).discreet_mode()
     } else {
         Palette::for_reading_theme(state.config.reading_theme)
     };
     fill_background(frame, palette);
-    if state.hidden {
-        draw_hidden(frame, palette);
-        return;
-    }
     if state.config.discreet_mode {
         draw_discreet(frame, state, palette);
         return;
@@ -31,20 +27,72 @@ pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, state: &ReaderState) {
         frame.area()
     } else {
         let [status_area, body_area, action_area] = hud_chunks(frame.area());
-        frame.render_widget(
-            Paragraph::new(status_line(state, palette))
-                .style(palette.base())
-                .alignment(Alignment::Center),
-            status_area,
-        );
-        frame.render_widget(
-            Paragraph::new(context_action_line(state, palette)).style(palette.base()),
-            action_area,
-        );
+        if state.hidden {
+            let neutral_status = if frame.area().width < 50 {
+                Line::from(vec![
+                    Span::styled("cargo test", palette.accent()),
+                    Span::styled(" · ", palette.muted()),
+                    Span::styled("Output folded", palette.muted()),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::styled("terminal", palette.muted()),
+                    Span::styled(" · ", palette.muted()),
+                    Span::styled("cargo test --workspace --lib", palette.accent()),
+                    Span::styled(" · ", palette.muted()),
+                    Span::styled("Output folded", palette.muted()),
+                ])
+            };
+            frame.render_widget(
+                Paragraph::new(neutral_status)
+                    .style(palette.base())
+                    .alignment(Alignment::Center),
+                status_area,
+            );
+            let neutral_action = if frame.area().width < 45 {
+                Line::from(vec![
+                    Span::styled("[ok] ", palette.accent()),
+                    Span::styled("38 passed", palette.body()),
+                    Span::styled(" · ", palette.muted()),
+                    Span::styled("[F12 resume]", palette.muted()),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::styled(" [ok] ", palette.accent()),
+                    Span::styled("cargo-test · 38 passed · exit code 0", palette.body()),
+                    Span::styled(" · ", palette.muted()),
+                    Span::styled("[F12 resume]", palette.muted()),
+                ])
+            };
+            frame.render_widget(
+                Paragraph::new(neutral_action).style(palette.base()),
+                action_area,
+            );
+        } else {
+            frame.render_widget(
+                Paragraph::new(status_line(state, palette))
+                    .style(palette.base())
+                    .alignment(Alignment::Center),
+                status_area,
+            );
+            frame.render_widget(
+                Paragraph::new(context_action_line(state, palette)).style(palette.base()),
+                action_area,
+            );
+        }
         body_area
     };
 
     let text_area = reading_text_area(body_area, state.config.text_width);
+    if state.hidden {
+        frame.render_widget(
+            Paragraph::new(simulated_tool_lines(usize::from(text_area.height), palette))
+                .style(palette.body()),
+            text_area,
+        );
+        return;
+    }
+
     frame.render_widget(
         Paragraph::new(render_reading_lines(state, palette)).style(palette.body()),
         text_area,
@@ -1121,219 +1169,234 @@ fn draw_discreet(frame: &mut ratatui::Frame<'_>, state: &ReaderState, palette: P
     }
 
     // 2. Session Context & Tool Activity (header)
-    let header_lines = generate_agent_header_lines(
-        usize::from(layout.header.height),
-        state,
-        palette,
-        start,
-        end,
-    );
+    let header_lines = if state.hidden {
+        let inspect_line = Line::from(vec![
+            Span::styled(format!("{} ", agent_symbol("❯", ">")), palette.accent()),
+            Span::styled("cargo test --workspace --lib", palette.body()),
+        ]);
+        let tool_call_line = Line::from(vec![
+            Span::styled(format!("{} ", agent_symbol("●", "*")), palette.accent()),
+            Span::styled(
+                r#"run_command(command="cargo test --workspace --lib")"#,
+                palette.body(),
+            ),
+        ]);
+        let tool_res_line = Line::styled(
+            format!(
+                "  {} Executing runner in isolated process · Output folded [38 passed]",
+                agent_symbol("⎿", "\\")
+            ),
+            palette.muted(),
+        );
+        if layout.mode == AgentViewMode::Full {
+            vec![inspect_line, tool_call_line, tool_res_line]
+        } else {
+            match layout.header.height {
+                1 => vec![tool_call_line],
+                _ => vec![tool_call_line, tool_res_line],
+            }
+        }
+    } else {
+        generate_agent_header_lines(
+            usize::from(layout.header.height),
+            state,
+            palette,
+            start,
+            end,
+        )
+    };
     frame.render_widget(Paragraph::new(header_lines), layout.header);
 
     // 3. Assistant Response (body)
-    let mut body_lines = Vec::new();
-    if state.agent.help {
-        let mut help_entries = vec![
-            Line::from("Local commands · j/k scroll · Esc close"),
-            Line::from(""),
-        ];
-        help_entries.extend(
-            DISCREET_BINDINGS
-                .iter()
-                .map(|b| Line::from(format!("  {:<12} {}", b.keys, b.label))),
-        );
-        help_entries.push(Line::from(""));
-        help_entries.push(Line::from("Executable local commands:"));
-        help_entries.extend(
-            LOCAL_COMMANDS
-                .iter()
-                .map(|(name, _)| Line::from(format!("  :{:<11} execute command", name))),
-        );
-        let visible_help = help_entries
-            .into_iter()
-            .skip(state.agent.help_offset)
-            .take(usize::from(net_height));
-        for line in visible_help {
-            body_lines.push(Line::from(vec![
-                Span::styled("  ", palette.muted()),
-                Span::styled(line.to_string(), palette.body()),
-            ]));
-        }
+    if state.hidden {
+        let tool_lines = simulated_tool_lines(usize::from(layout.body.height), palette);
+        frame.render_widget(Paragraph::new(tool_lines), layout.body);
     } else {
-        body_lines.push(Line::from(vec![
-            Span::styled(format!("{} ", agent_symbol("●", "*")), palette.accent()),
-            Span::styled("Assistant", palette.body()),
-        ]));
+        let mut body_lines = Vec::new();
+        if state.agent.help {
+            let mut help_entries = vec![
+                Line::from("Local commands · j/k scroll · Esc close"),
+                Line::from(""),
+            ];
+            help_entries.extend(
+                DISCREET_BINDINGS
+                    .iter()
+                    .map(|b| Line::from(format!("  {:<12} {}", b.keys, b.label))),
+            );
+            help_entries.push(Line::from(""));
+            help_entries.push(Line::from("Executable local commands:"));
+            help_entries.extend(
+                LOCAL_COMMANDS
+                    .iter()
+                    .map(|(name, _)| Line::from(format!("  :{:<11} execute command", name))),
+            );
+            let visible_help = help_entries
+                .into_iter()
+                .skip(state.agent.help_offset)
+                .take(usize::from(net_height));
+            for line in visible_help {
+                body_lines.push(Line::from(vec![
+                    Span::styled("  ", palette.muted()),
+                    Span::styled(line.to_string(), palette.body()),
+                ]));
+            }
+        } else {
+            body_lines.push(Line::from(vec![
+                Span::styled(format!("{} ", agent_symbol("●", "*")), palette.accent()),
+                Span::styled("Assistant", palette.body()),
+            ]));
 
-        let visible_lines = state.agent.view.visible(net_height);
-        for (i, vline) in visible_lines.iter().enumerate() {
-            let line_num = start + i;
-            let is_overlap = i < state.agent.view.context_rows;
-            let text_style = if is_overlap {
-                palette.muted()
-            } else {
-                palette.body()
-            };
-            let raw_text = &vline.line.text;
-            match state.agent.density {
-                AgentDensity::Comfortable => {
-                    body_lines.push(Line::from(vec![Span::styled(raw_text.clone(), text_style)]));
-                }
-                AgentDensity::Inspect => {
-                    body_lines.push(Line::from(vec![
-                        Span::styled(format!("{:>4} │ ", line_num), palette.muted()),
-                        Span::styled(raw_text.clone(), text_style),
-                    ]));
+            let visible_lines = state.agent.view.visible(net_height);
+            for (i, vline) in visible_lines.iter().enumerate() {
+                let line_num = start + i;
+                let is_overlap = i < state.agent.view.context_rows;
+                let text_style = if is_overlap {
+                    palette.muted()
+                } else {
+                    palette.body()
+                };
+                let raw_text = &vline.line.text;
+                match state.agent.density {
+                    AgentDensity::Comfortable => {
+                        body_lines
+                            .push(Line::from(vec![Span::styled(raw_text.clone(), text_style)]));
+                    }
+                    AgentDensity::Inspect => {
+                        body_lines.push(Line::from(vec![
+                            Span::styled(format!("{:>4} │ ", line_num), palette.muted()),
+                            Span::styled(raw_text.clone(), text_style),
+                        ]));
+                    }
                 }
             }
-        }
 
-        if layout.body.height > net_height + 1 {
-            body_lines.push(Line::from(vec![Span::styled(
-                "  [Output complete]",
-                palette.muted(),
-            )]));
+            if layout.body.height > net_height + 1 {
+                body_lines.push(Line::from(vec![Span::styled(
+                    "  [Output complete]",
+                    palette.muted(),
+                )]));
+            }
         }
+        frame.render_widget(Paragraph::new(body_lines), layout.body);
     }
-    frame.render_widget(Paragraph::new(body_lines), layout.body);
 
     // 4. Activity & Actions (footer)
-    let current_chunk = (start / net_height as usize).saturating_add(1);
-    let total_chunks = (total / net_height as usize).max(1);
-    let chunk_label = format!("chunk {current_chunk}/{total_chunks}");
-
-    let status_hint = match state.agent.receipt {
-        Some(receipt) => format!("✓ {receipt}"),
-        None if state.agent.command.is_some() => {
-            "Enter execute · Esc cancel · Tab complete".to_string()
-        }
-        None if state.agent.help => "j/k scroll · Esc close".to_string(),
-        None => "j/k scroll · : cmd · / find · F12 fold".to_string(),
-    };
-
-    let prompt_spans = match &state.agent.command {
-        Some(text) => vec![
-            Span::styled(format!("{} :", agent_symbol("❯", ">")), palette.accent()),
-            Span::styled(text.clone(), palette.body()),
-            Span::styled("█", palette.accent()),
-        ],
-        None => vec![
+    let footer_lines = if state.hidden {
+        let prompt_spans = vec![
             Span::styled(format!("{} ", agent_symbol("❯", ">")), palette.muted()),
             Span::styled("continue_", palette.muted()),
-        ],
-    };
-
-    let footer_lines = if layout.mode == AgentViewMode::Full && layout.footer.height >= 3 {
-        vec![
-            Line::styled(
-                agent_symbol("─", "-").repeat(usize::from(width)),
-                palette.muted(),
-            ),
-            split_row_line(
-                vec![
-                    Span::styled("activity: ", palette.muted()),
-                    Span::styled("init ✓   read ✓   render ✓", palette.accent()),
+        ];
+        if layout.mode == AgentViewMode::Full && layout.footer.height >= 3 {
+            vec![
+                Line::styled(
+                    agent_symbol("─", "-").repeat(usize::from(width)),
+                    palette.muted(),
+                ),
+                split_row_line(
+                    vec![
+                        Span::styled("activity: ", palette.muted()),
+                        Span::styled("cargo-test ✓ · exit code 0", palette.accent()),
+                    ],
+                    vec![Span::styled("38 passed · Output folded", palette.muted())],
+                    width,
+                ),
+                split_row_line(
+                    prompt_spans,
+                    vec![Span::styled("F12 resume", palette.muted())],
+                    width,
+                ),
+            ]
+        } else {
+            match layout.footer.height {
+                0 => Vec::new(),
+                1 => vec![Line::from(prompt_spans)],
+                _ => vec![
+                    Line::from(prompt_spans),
+                    Line::styled(
+                        "  cargo-test ✓ · 38 passed · Output folded · F12 resume",
+                        palette.muted(),
+                    ),
                 ],
-                vec![Span::styled(chunk_label, palette.muted())],
-                width,
-            ),
-            split_row_line(
-                prompt_spans,
-                vec![Span::styled(status_hint, palette.muted())],
-                width,
-            ),
-        ]
+            }
+        }
     } else {
-        match layout.footer.height {
-            0 => Vec::new(),
-            1 => vec![Line::from(prompt_spans)],
-            _ => vec![
-                Line::from(prompt_spans),
-                Line::styled(format!("  {status_hint}"), palette.muted()),
+        let current_chunk = (start / net_height as usize).saturating_add(1);
+        let total_chunks = (total / net_height as usize).max(1);
+        let chunk_label = format!("chunk {current_chunk}/{total_chunks}");
+
+        let status_hint = match state.agent.receipt {
+            Some(receipt) => format!("✓ {receipt}"),
+            None if state.agent.command.is_some() => {
+                "Enter execute · Esc cancel · Tab complete".to_string()
+            }
+            None if state.agent.help => "j/k scroll · Esc close".to_string(),
+            None => "j/k scroll · : cmd · / find · F12 fold".to_string(),
+        };
+
+        let prompt_spans = match &state.agent.command {
+            Some(text) => vec![
+                Span::styled(format!("{} :", agent_symbol("❯", ">")), palette.accent()),
+                Span::styled(text.clone(), palette.body()),
+                Span::styled("█", palette.accent()),
             ],
+            None => vec![
+                Span::styled(format!("{} ", agent_symbol("❯", ">")), palette.muted()),
+                Span::styled("continue_", palette.muted()),
+            ],
+        };
+
+        if layout.mode == AgentViewMode::Full && layout.footer.height >= 3 {
+            vec![
+                Line::styled(
+                    agent_symbol("─", "-").repeat(usize::from(width)),
+                    palette.muted(),
+                ),
+                split_row_line(
+                    vec![
+                        Span::styled("activity: ", palette.muted()),
+                        Span::styled("init ✓   read ✓   render ✓", palette.accent()),
+                    ],
+                    vec![Span::styled(chunk_label, palette.muted())],
+                    width,
+                ),
+                split_row_line(
+                    prompt_spans,
+                    vec![Span::styled(status_hint, palette.muted())],
+                    width,
+                ),
+            ]
+        } else {
+            match layout.footer.height {
+                0 => Vec::new(),
+                1 => vec![Line::from(prompt_spans)],
+                _ => vec![
+                    Line::from(prompt_spans),
+                    Line::styled(format!("  {status_hint}"), palette.muted()),
+                ],
+            }
         }
     };
     frame.render_widget(Paragraph::new(footer_lines), layout.footer);
 
-    if let Some(text) = state.agent.command.as_ref() {
-        let prompt_row_offset = if layout.mode == AgentViewMode::Full && layout.footer.height >= 3 {
-            2
-        } else {
-            0
-        };
-        let row = layout.footer.y + prompt_row_offset;
-        let col = (3 + text.width() as u16).min(layout.footer.width.saturating_sub(1));
-        frame.set_cursor_position((layout.footer.x + col, row));
+    if !state.hidden {
+        if let Some(text) = state.agent.command.as_ref() {
+            let prompt_row_offset =
+                if layout.mode == AgentViewMode::Full && layout.footer.height >= 3 {
+                    2
+                } else {
+                    0
+                };
+            let row = layout.footer.y + prompt_row_offset;
+            let col = (3 + text.width() as u16).min(layout.footer.width.saturating_sub(1));
+            frame.set_cursor_position((layout.footer.x + col, row));
+        }
     }
 }
 
-// Deliberately accepts no ReaderState, document, notification or input buffer.
-fn draw_hidden(frame: &mut ratatui::Frame<'_>, palette: Palette) {
-    let layout = AgentLayout::new(frame.area(), None);
-    let width = frame.area().width;
-
-    if layout.mode == AgentViewMode::Full && layout.banner.height >= 3 {
-        let banner_lines = vec![
-            split_row_line(
-                vec![
-                    Span::styled("workspace: ", palette.muted()),
-                    Span::styled("Reader-cli", palette.body()),
-                ],
-                vec![
-                    Span::styled("session: ", palette.muted()),
-                    Span::styled("local", palette.body()),
-                ],
-                width,
-            ),
-            split_row_line(
-                vec![
-                    Span::styled("mode: ", palette.muted()),
-                    Span::styled("Agent Terminal Reading", palette.body()),
-                ],
-                vec![
-                    Span::styled("file: ", palette.muted()),
-                    Span::styled("context.txt", palette.body()),
-                ],
-                width,
-            ),
-            Line::styled(
-                agent_symbol("─", "-").repeat(usize::from(width)),
-                palette.muted(),
-            ),
-        ];
-        frame.render_widget(Paragraph::new(banner_lines), layout.banner);
+fn simulated_tool_lines(target_height: usize, palette: Palette) -> Vec<Line<'static>> {
+    if target_height == 0 {
+        return Vec::new();
     }
-
-    let inspect_line = Line::from(vec![
-        Span::styled(format!("{} ", agent_symbol("❯", ">")), palette.accent()),
-        Span::styled("cargo test --workspace --lib", palette.body()),
-    ]);
-    let tool_call_line = Line::from(vec![
-        Span::styled(format!("{} ", agent_symbol("●", "*")), palette.accent()),
-        Span::styled(
-            r#"run_command(command="cargo test --workspace --lib")"#,
-            palette.body(),
-        ),
-    ]);
-    let tool_res_line = Line::styled(
-        format!(
-            "  {} Executing runner in isolated process · Output folded [38 passed]",
-            agent_symbol("⎿", "\\")
-        ),
-        palette.muted(),
-    );
-
-    let header_lines = if layout.mode == AgentViewMode::Full {
-        vec![inspect_line, tool_call_line, tool_res_line]
-    } else {
-        match layout.header.height {
-            1 => vec![tool_call_line],
-            _ => vec![tool_call_line, tool_res_line],
-        }
-    };
-    frame.render_widget(Paragraph::new(header_lines), layout.header);
-
-    // Render simulated tool execution output into layout.body to replace the book text completely
     let mut body_lines = Vec::new();
     body_lines.push(Line::from(vec![
         Span::styled(format!("{} ", agent_symbol("●", "*")), palette.accent()),
@@ -1341,9 +1404,10 @@ fn draw_hidden(frame: &mut ratatui::Frame<'_>, palette: Palette) {
             r#"run_command command="cargo test --workspace --lib""#,
             palette.body(),
         ),
+        Span::styled(" · Output folded", palette.muted()),
     ]));
     body_lines.push(Line::styled(
-        "   Compiling reader v0.1.0 (G:/Document/reader/Reader-cli)",
+        "   Compiling reader v0.1.0 (/workspace/reader-cli)",
         palette.muted(),
     ));
     body_lines.push(Line::styled("   Checking ratatui v0.29.0", palette.muted()));
@@ -1381,9 +1445,18 @@ fn draw_hidden(frame: &mut ratatui::Frame<'_>, palette: Palette) {
         "test session::tests::test_reading_recency ... ok",
         "test format::tests::test_mobi_metadata ... ok",
         "test config::tests::test_persistence ... ok",
+        "test book::tests::test_metadata_sanitization ... ok",
+        "test shelf::tests::test_cache_invalidation ... ok",
+        "test tui::tests::test_differential_render ... ok",
+        "test discreet::tests::test_anchor_preservation ... ok",
+        "test render::tests::test_cjk_wrap_boundaries ... ok",
+        "test storage::tests::test_migration_integrity ... ok",
+        "test search::tests::test_case_folding ... ok",
+        "test network::tests::test_redirect_boundary ... ok",
+        "test pagination::tests::test_vertical_resize ... ok",
+        "test session::tests::test_reading_speed_calc ... ok",
     ];
 
-    let target_height = usize::from(layout.body.height);
     for tc in test_cases {
         if body_lines.len() + 3 >= target_height {
             break;
@@ -1405,44 +1478,7 @@ fn draw_hidden(frame: &mut ratatui::Frame<'_>, palette: Palette) {
         ));
     }
     body_lines.truncate(target_height);
-    frame.render_widget(Paragraph::new(body_lines), layout.body);
-
-    let prompt_spans = vec![
-        Span::styled(format!("{} ", agent_symbol("❯", ">")), palette.muted()),
-        Span::styled("continue_", palette.muted()),
-    ];
-
-    let footer_lines = if layout.mode == AgentViewMode::Full && layout.footer.height >= 3 {
-        vec![
-            Line::styled(
-                agent_symbol("─", "-").repeat(usize::from(width)),
-                palette.muted(),
-            ),
-            split_row_line(
-                vec![
-                    Span::styled("activity: ", palette.muted()),
-                    Span::styled("cargo-test ✓ · exit code 0", palette.accent()),
-                ],
-                vec![Span::styled("38 passed · output folded", palette.muted())],
-                width,
-            ),
-            split_row_line(
-                prompt_spans,
-                vec![Span::styled("ready", palette.muted())],
-                width,
-            ),
-        ]
-    } else {
-        match layout.footer.height {
-            0 => Vec::new(),
-            1 => vec![Line::from(prompt_spans)],
-            _ => vec![
-                Line::from(prompt_spans),
-                Line::styled("  cargo-test ✓ · 38 passed", palette.muted()),
-            ],
-        }
-    };
-    frame.render_widget(Paragraph::new(footer_lines), layout.footer);
+    body_lines
 }
 
 fn truncate_width(text: &str, width: usize) -> String {
@@ -1829,6 +1865,59 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn f12_subtle_in_place_fold_in_both_discreet_and_normal_modes() {
+        // 1. Discreet mode test
+        let mut s = state();
+        s.resize(80, 24);
+        s.update(crate::reader_state::ReaderAction::ToggleDiscreet);
+        assert!(s.config.discreet_mode);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| draw(f, &s)).unwrap();
+        let reading_screen = format!("{}", terminal.backend());
+        assert!(reading_screen.contains("workspace: Reader-cli"));
+        assert!(reading_screen.contains("Agent Terminal Reading"));
+        assert!(reading_screen.contains("Assistant"));
+
+        // Toggle hidden:
+        s.update(crate::reader_state::ReaderAction::ToggleHidden);
+        terminal.draw(|f| draw(f, &s)).unwrap();
+        let folded_screen = format!("{}", terminal.backend());
+        // Outer banner remains identical
+        assert!(folded_screen.contains("workspace: Reader-cli"));
+        assert!(folded_screen.contains("Agent Terminal Reading"));
+        // Body was subtly replaced with tool execution
+        assert!(folded_screen.contains("run_command command="));
+        assert!(folded_screen.contains("Output folded"));
+        assert!(folded_screen.contains("running 38 tests"));
+        assert!(folded_screen.contains("F12 resume"));
+
+        // Toggle back:
+        s.update(crate::reader_state::ReaderAction::ToggleHidden);
+        terminal.draw(|f| draw(f, &s)).unwrap();
+        let resumed_screen = format!("{}", terminal.backend());
+        assert!(resumed_screen.contains("Assistant"));
+        assert!(resumed_screen.contains("bright readable text"));
+
+        // 2. Normal mode test
+        let mut s2 = state();
+        s2.resize(80, 24);
+        assert!(!s2.config.discreet_mode);
+        terminal.draw(|f| draw(f, &s2)).unwrap();
+        let normal_screen = format!("{}", terminal.backend());
+        assert!(normal_screen.contains("《Book》"));
+
+        // Toggle hidden in normal mode:
+        s2.update(crate::reader_state::ReaderAction::ToggleHidden);
+        terminal.draw(|f| draw(f, &s2)).unwrap();
+        let normal_folded = format!("{}", terminal.backend());
+        assert!(!normal_folded.contains("《Book》"));
+        assert!(normal_folded.contains("cargo test"));
+        assert!(normal_folded.contains("Output folded"));
+        assert!(normal_folded.contains("running 38 tests"));
+        assert!(normal_folded.contains("[F12 resume]"));
     }
 
     #[test]

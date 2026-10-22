@@ -1,4 +1,7 @@
-use std::sync::mpsc::{channel, Receiver, Sender};
+#[cfg(windows)]
+use std::sync::mpsc::Sender;
+use std::sync::mpsc::{channel, Receiver};
+#[cfg(windows)]
 use std::thread;
 
 pub struct GlobalHotkeyListener {
@@ -54,6 +57,11 @@ impl Drop for GlobalHotkeyListener {
             let _ = handle.join();
         }
     }
+}
+
+#[cfg(not(windows))]
+impl Drop for GlobalHotkeyListener {
+    fn drop(&mut self) {}
 }
 
 #[cfg(windows)]

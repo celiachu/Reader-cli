@@ -13,6 +13,10 @@ pub enum ReadingTheme {
     Sepia,
     Eink,
     Nord,
+    Forest,
+    Dracula,
+    Rose,
+    Solarized,
 }
 
 impl ReadingTheme {
@@ -21,16 +25,24 @@ impl ReadingTheme {
             Self::Terminal => Self::Sepia,
             Self::Sepia => Self::Eink,
             Self::Eink => Self::Nord,
-            Self::Nord => Self::Terminal,
+            Self::Nord => Self::Forest,
+            Self::Forest => Self::Dracula,
+            Self::Dracula => Self::Rose,
+            Self::Rose => Self::Solarized,
+            Self::Solarized => Self::Terminal,
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Terminal => "Terminal Default",
-            Self::Sepia => "Warm Sepia (羊皮纸)",
-            Self::Eink => "Paper E-ink (墨水屏)",
+            Self::Terminal => "Terminal Default (终端原生)",
+            Self::Sepia => "Warm Sepia (羊皮纸暖色)",
+            Self::Eink => "Paper E-ink (纸质水墨屏)",
             Self::Nord => "Nord Dark (极光夜)",
+            Self::Forest => "Forest Mint (青竹静谧绿)",
+            Self::Dracula => "Dracula Dark (赛博暗夜)",
+            Self::Rose => "Rose Pine (晚霞落樱)",
+            Self::Solarized => "Solarized Light (日光宣纸)",
         }
     }
 }
@@ -120,12 +132,84 @@ impl Palette {
         }
     }
 
+    pub const fn forest() -> Self {
+        Self {
+            background: Color::Rgb(24, 34, 28),
+            body: Color::Rgb(216, 232, 220),
+            muted: Color::Rgb(120, 155, 130),
+            accent: Color::Rgb(130, 205, 155),
+            discreet_body: Color::Rgb(216, 232, 220),
+            discreet_muted: Color::Rgb(120, 155, 130),
+            discreet_auxiliary: Color::Rgb(130, 205, 155),
+            selected_foreground: Color::Rgb(24, 34, 28),
+            selected_background: Color::Rgb(130, 205, 155),
+            border: Color::Rgb(48, 72, 58),
+            error: Color::Rgb(230, 105, 95),
+            success: Color::Rgb(140, 210, 130),
+        }
+    }
+
+    pub const fn dracula() -> Self {
+        Self {
+            background: Color::Rgb(40, 42, 54),
+            body: Color::Rgb(248, 248, 242),
+            muted: Color::Rgb(98, 114, 164),
+            accent: Color::Rgb(189, 147, 249),
+            discreet_body: Color::Rgb(248, 248, 242),
+            discreet_muted: Color::Rgb(98, 114, 164),
+            discreet_auxiliary: Color::Rgb(139, 233, 253),
+            selected_foreground: Color::Rgb(40, 42, 54),
+            selected_background: Color::Rgb(189, 147, 249),
+            border: Color::Rgb(68, 71, 90),
+            error: Color::Rgb(255, 85, 85),
+            success: Color::Rgb(80, 250, 123),
+        }
+    }
+
+    pub const fn rose() -> Self {
+        Self {
+            background: Color::Rgb(31, 29, 46),
+            body: Color::Rgb(224, 222, 244),
+            muted: Color::Rgb(144, 140, 170),
+            accent: Color::Rgb(235, 188, 186),
+            discreet_body: Color::Rgb(224, 222, 244),
+            discreet_muted: Color::Rgb(144, 140, 170),
+            discreet_auxiliary: Color::Rgb(235, 188, 186),
+            selected_foreground: Color::Rgb(31, 29, 46),
+            selected_background: Color::Rgb(235, 188, 186),
+            border: Color::Rgb(68, 65, 90),
+            error: Color::Rgb(235, 111, 146),
+            success: Color::Rgb(156, 207, 216),
+        }
+    }
+
+    pub const fn solarized() -> Self {
+        Self {
+            background: Color::Rgb(253, 246, 227),
+            body: Color::Rgb(88, 110, 117),
+            muted: Color::Rgb(147, 161, 161),
+            accent: Color::Rgb(38, 139, 210),
+            discreet_body: Color::Rgb(88, 110, 117),
+            discreet_muted: Color::Rgb(147, 161, 161),
+            discreet_auxiliary: Color::Rgb(38, 139, 210),
+            selected_foreground: Color::Rgb(253, 246, 227),
+            selected_background: Color::Rgb(38, 139, 210),
+            border: Color::Rgb(220, 215, 195),
+            error: Color::Rgb(220, 50, 47),
+            success: Color::Rgb(133, 153, 0),
+        }
+    }
+
     pub fn for_reading_theme(theme: ReadingTheme) -> Self {
         match theme {
             ReadingTheme::Terminal => Self::terminal(),
             ReadingTheme::Sepia => Self::sepia(),
             ReadingTheme::Eink => Self::eink(),
             ReadingTheme::Nord => Self::nord(),
+            ReadingTheme::Forest => Self::forest(),
+            ReadingTheme::Dracula => Self::dracula(),
+            ReadingTheme::Rose => Self::rose(),
+            ReadingTheme::Solarized => Self::solarized(),
         }
     }
 
@@ -458,5 +542,52 @@ mod tests {
         assert_eq!(palette.background, Color::Reset);
         assert_eq!(palette.body, Color::Reset);
         assert_eq!(palette.muted, Color::DarkGray);
+    }
+
+    #[test]
+    fn reading_themes_cycle_all_eight_variants() {
+        let mut theme = ReadingTheme::Terminal;
+        let expected = [
+            ReadingTheme::Sepia,
+            ReadingTheme::Eink,
+            ReadingTheme::Nord,
+            ReadingTheme::Forest,
+            ReadingTheme::Dracula,
+            ReadingTheme::Rose,
+            ReadingTheme::Solarized,
+            ReadingTheme::Terminal,
+        ];
+        for next in expected {
+            theme = theme.next();
+            assert_eq!(theme, next);
+            assert!(!theme.label().is_empty());
+            let palette = Palette::for_reading_theme(theme);
+            if theme != ReadingTheme::Terminal {
+                assert_ne!(palette.body, palette.background);
+            } else {
+                assert_eq!(palette.body, Color::Reset);
+                assert_eq!(palette.background, Color::Reset);
+            }
+        }
+    }
+
+    #[test]
+    fn reading_themes_serialize_and_deserialize_lowercase() {
+        let themes = [
+            (ReadingTheme::Terminal, "\"terminal\""),
+            (ReadingTheme::Sepia, "\"sepia\""),
+            (ReadingTheme::Eink, "\"eink\""),
+            (ReadingTheme::Nord, "\"nord\""),
+            (ReadingTheme::Forest, "\"forest\""),
+            (ReadingTheme::Dracula, "\"dracula\""),
+            (ReadingTheme::Rose, "\"rose\""),
+            (ReadingTheme::Solarized, "\"solarized\""),
+        ];
+        for (theme, json) in themes {
+            let serialized = serde_json::to_string(&theme).unwrap();
+            assert_eq!(serialized, json);
+            let deserialized: ReadingTheme = serde_json::from_str(json).unwrap();
+            assert_eq!(deserialized, theme);
+        }
     }
 }

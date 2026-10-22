@@ -475,6 +475,7 @@ enum ShelfCommandUi {
     Quit,
     Network,
     SyncNetwork,
+    CycleTheme,
 }
 
 const OPEN_KEYS: &[KeyChord] = &[KeyChord::plain(KeyCode::Enter)];
@@ -605,6 +606,16 @@ const SHELF_BINDINGS: &[KeyBinding<ShelfCommandUi>] = &[
         short_label: "Resume",
         show_in_hud: false,
         hud_priority: 2,
+    },
+    KeyBinding {
+        command: ShelfCommandUi::CycleTheme,
+        chords: &[KeyChord::plain(KeyCode::Char('C'))],
+        keys: "C",
+        hud_keys: "C",
+        label: "Cycle theme / skin",
+        short_label: "Skin",
+        show_in_hud: true,
+        hud_priority: 1,
     },
     KeyBinding {
         command: ShelfCommandUi::Help,
@@ -750,6 +761,12 @@ fn handle_browse_key(
         }
         Some(ShelfCommandUi::Sort) => app.cycle_sort(),
         Some(ShelfCommandUi::Help) => app.mode = ShelfMode::Help,
+        Some(ShelfCommandUi::CycleTheme) => {
+            let new_theme = config.cycle_reading_theme();
+            let _ = config.save();
+            app.message = format!("Skin: {}", new_theme.label());
+            return Ok(None);
+        }
         Some(ShelfCommandUi::Delete) => {
             if let Some(row) = app.selected_row() {
                 if matches!(row.source, BookSource::Remote(_)) {
@@ -1016,8 +1033,8 @@ fn handle_confirm_delete_file_key(
     Ok(None)
 }
 
-fn draw(frame: &mut ratatui::Frame<'_>, app: &ShelfApp, store: &Store, _config: &ReaderConfig) {
-    let palette = Palette::terminal();
+fn draw(frame: &mut ratatui::Frame<'_>, app: &ShelfApp, store: &Store, config: &ReaderConfig) {
+    let palette = Palette::for_reading_theme(config.reading_theme);
     fill_background(frame, palette);
     let [status_area, body_area, action_area] = hud_chunks(app.viewport);
 
@@ -1153,7 +1170,6 @@ fn build_row_line(
         .map(|value| fit_column(value, 16))
         .unwrap_or_else(|| fit_column("-", 16));
     let percent = compute_percent(row);
-    let bar = progress_bar(percent, PROGRESS_BAR_WIDTH);
     let last = row
         .last_opened
         .map(format_relative_time)
@@ -1163,30 +1179,75 @@ fn build_row_line(
     } else {
         format!("{}bm", row.bookmark_count)
     };
-    let status = match &row.source {
+    let (status, status_style) = match &row.source {
         BookSource::Local => {
             if row.missing {
-                "MISS"
+                ("MISS", palette.error())
             } else {
-                "OK"
+                ("OK", palette.success())
             }
         }
-        BookSource::Remote(_) => "NET",
+        BookSource::Remote(_) => ("NET", palette.accent()),
     };
     let format = row.format.label();
-    let text = format!(
-        "{prefix}{marker} {title}  {author}  {bar} {percent:>3}%  {last:>10}  {bookmarks:>4}  {format} {status}"
-    );
-    let style = if selected {
-        palette.selected()
-    } else if row.missing {
-        palette.error()
-    } else if matches!(row.source, BookSource::Remote(_)) {
-        palette.accent()
+
+    if selected {
+        let bar = progress_bar(percent, PROGRESS_BAR_WIDTH);
+        let text = format!(
+            "{prefix}{marker} {title}  {author}  {bar} {percent:>3}%  {last:>10}  {bookmarks:>4}  {format} {status}"
+        );
+        Line::from(Span::styled(text, palette.selected()))
     } else {
-        palette.body()
-    };
-    Line::from(Span::styled(text, style))
+        let filled = (percent as usize * PROGRESS_BAR_WIDTH + 50) / 100;
+        let filled = filled.min(PROGRESS_BAR_WIDTH);
+        let empty = PROGRESS_BAR_WIDTH.saturating_sub(filled);
+
+        let mut spans = Vec::with_capacity(16);
+        spans.push(Span::styled(prefix, palette.muted()));
+        spans.push(Span::styled(marker, palette.accent()));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(title, palette.body()));
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(author, palette.muted()));
+        spans.push(Span::raw("  "));
+
+        if filled > 0 {
+            let filled_style = if percent >= 100 {
+                palette.success()
+            } else {
+                palette.accent()
+            };
+            spans.push(Span::styled("\u{2588}".repeat(filled), filled_style));
+        }
+        if empty > 0 {
+            spans.push(Span::styled("\u{2591}".repeat(empty), palette.muted()));
+        }
+
+        spans.push(Span::raw(" "));
+        let percent_style = if percent >= 100 {
+            palette.success()
+        } else if percent > 0 {
+            palette.accent()
+        } else {
+            palette.muted()
+        };
+        spans.push(Span::styled(format!("{percent:>3}%"), percent_style));
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(format!("{last:>10}"), palette.muted()));
+        spans.push(Span::raw("  "));
+        let bkmk_style = if row.bookmark_count > 0 {
+            palette.accent()
+        } else {
+            palette.muted()
+        };
+        spans.push(Span::styled(format!("{bookmarks:>4}"), bkmk_style));
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(format, palette.muted()));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(status, status_style));
+
+        Line::from(spans)
+    }
 }
 
 fn compute_percent(row: &ShelfRow) -> u16 {
@@ -2068,6 +2129,41 @@ mod tests {
             .find(['\u{2588}', '\u{2591}'])
             .expect("row should contain a progress bar");
         assert_eq!(text[..bar_start].width(), 54);
+    }
+
+    #[test]
+    fn shelf_cycle_theme_updates_config_and_message() {
+        let mut store = make_empty_store();
+        let mut app = ShelfApp {
+            books: vec![],
+            visible: vec![],
+            selection: 0,
+            sort: ShelfSort::Title,
+            query: String::new(),
+            mode: ShelfMode::Browse,
+            viewport: Rect::new(0, 0, 80, 24),
+            message: String::new(),
+            pending_delete_file: None,
+            filter: ShelfFilter::All,
+            network_client: None,
+            pending_network: None,
+            pending_download: None,
+            is_syncing_network: false,
+        };
+        let mut config = ReaderConfig::default();
+        assert_eq!(config.reading_theme, crate::ui::ReadingTheme::Terminal);
+
+        let outcome = handle_key(
+            KeyEvent::new(KeyCode::Char('C'), KeyModifiers::NONE),
+            &mut app,
+            &mut store,
+            &mut config,
+        )
+        .unwrap();
+
+        assert!(outcome.is_none());
+        assert_eq!(config.reading_theme, crate::ui::ReadingTheme::Sepia);
+        assert!(app.message.contains("Warm Sepia"));
     }
 
     #[test]

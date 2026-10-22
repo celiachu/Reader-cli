@@ -278,11 +278,10 @@ impl NetworkShelf {
                 self.selection = (self.selection + self.books.len() - 1) % self.books.len()
             }
             Action::Search => self.search_input = Some(self.query.clone()),
-            Action::NextPage => {
-                if self.advance_page() {
-                    self.load(client);
-                }
+            Action::NextPage if self.advance_page() => {
+                self.load(client);
             }
+            Action::NextPage => {}
             Action::PreviousPage if self.page_index > 0 => {
                 self.page_index -= 1;
                 self.books.clear();

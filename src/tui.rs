@@ -151,8 +151,8 @@ fn run_reader_with_data(
         let effects = state.update(action);
         // Also catches :fold, not just the physical F12 key. No disk
         // work, session finalization or notification precedes this frame.
-        if state.hidden && !was_hidden {
-            terminal.clear()?;
+        // Differential redraw in place without terminal.clear() to avoid full-screen flash.
+        if state.hidden != was_hidden {
             terminal.draw(|frame| crate::reader_view::draw(frame, &state))?;
         }
         let wall = time::OffsetDateTime::now_utc();
