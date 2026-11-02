@@ -55,33 +55,29 @@ pub fn is_cjk_character(ch: char) -> bool {
 /// - 空格、制表符与控制字符忽略不计
 pub fn count_effective_reading_chars_in_line(line: &str) -> usize {
     let mut count = 0;
-    let mut in_ascii_word = false;
-    let mut ascii_word_len = 0;
+    let mut word_len = 0;
 
     for ch in line.chars() {
         if is_cjk_character(ch) {
-            if in_ascii_word {
-                count += (ascii_word_len / 5).max(1);
-                in_ascii_word = false;
-                ascii_word_len = 0;
+            if word_len > 0 {
+                count += (word_len / 5).max(1);
+                word_len = 0;
             }
             count += 1;
         } else if ch.is_ascii_alphanumeric() || (ch.is_alphabetic() && !ch.is_ascii()) {
-            in_ascii_word = true;
-            ascii_word_len += 1;
+            word_len += 1;
         } else {
-            if in_ascii_word {
-                count += (ascii_word_len / 5).max(1);
-                in_ascii_word = false;
-                ascii_word_len = 0;
+            if word_len > 0 {
+                count += (word_len / 5).max(1);
+                word_len = 0;
             }
             if !ch.is_whitespace() && !ch.is_control() {
                 count += 1;
             }
         }
     }
-    if in_ascii_word {
-        count += (ascii_word_len / 5).max(1);
+    if word_len > 0 {
+        count += (word_len / 5).max(1);
     }
     count
 }
@@ -194,7 +190,7 @@ impl SpeedCalibration {
         let mut cpms: Vec<u32> = self.samples.iter().map(|s| s.cpm).collect();
         cpms.sort_unstable();
         let mid = cpms.len() / 2;
-        let median = if cpms.len().is_multiple_of(2) && mid > 0 {
+        let median = if cpms.len().is_multiple_of(2) {
             (cpms[mid - 1] + cpms[mid]) / 2
         } else {
             cpms[mid]
@@ -247,23 +243,6 @@ impl AutoReadingState {
             line_timer_started: now,
             line_target_duration: MIN_LINE_DURATION,
             line_elapsed_before_pause: Duration::ZERO,
-        }
-    }
-
-    /// 切换自动阅读总开关（Start / Stop）
-    pub fn toggle(
-        &mut self,
-        page_chars: usize,
-        is_chapter_start: bool,
-        first_line: Option<&str>,
-        now: Instant,
-    ) -> bool {
-        if self.active {
-            self.stop();
-            false
-        } else {
-            self.start(page_chars, is_chapter_start, first_line, now);
-            true
         }
     }
 
@@ -336,6 +315,18 @@ impl AutoReadingState {
         }
     }
 
+    /// 行推移模式下当前行已停留时长
+    pub fn line_elapsed(&self, now: Instant) -> Duration {
+        if !self.active {
+            return Duration::ZERO;
+        }
+        if self.paused {
+            self.line_elapsed_before_pause
+        } else {
+            self.line_elapsed_before_pause + now.saturating_duration_since(self.line_timer_started)
+        }
+    }
+
     /// 当前页剩余停留时间
     pub fn remaining_time(&self, now: Instant) -> Duration {
         let elapsed = self.elapsed(now);
@@ -359,15 +350,10 @@ impl AutoReadingState {
 
     /// 行推移模式下：检查当前行是否已到达推移行时间
     pub fn is_line_due(&self, now: Instant) -> bool {
-        if !self.active || self.paused || self.mode != AutoReadingMode::LineScroll {
-            return false;
-        }
-        let line_elapsed = if self.paused {
-            self.line_elapsed_before_pause
-        } else {
-            self.line_elapsed_before_pause + now.saturating_duration_since(self.line_timer_started)
-        };
-        line_elapsed >= self.line_target_duration
+        self.active
+            && !self.paused
+            && self.mode == AutoReadingMode::LineScroll
+            && self.line_elapsed(now) >= self.line_target_duration
     }
 
     /// 页面重置（翻至新页或手动调整时，重置页面计时器）
@@ -393,12 +379,8 @@ impl AutoReadingState {
         is_chapter_start: bool,
         now: Instant,
     ) -> u32 {
-        let old_ratio = self.progress_ratio(now);
-        self.cpm = (self.cpm as i32 + delta).clamp(60, 2000) as u32;
-        self.target_duration = calculate_page_duration(self.cpm, page_chars, is_chapter_start);
-        let new_elapsed = self.target_duration.mul_f32(old_ratio);
-        self.elapsed_before_pause = new_elapsed;
-        self.timer_started = now;
+        let new_cpm = (self.cpm as i32 + delta).clamp(60, 2000) as u32;
+        self.set_cpm(new_cpm, page_chars, is_chapter_start, now);
         self.cpm
     }
 

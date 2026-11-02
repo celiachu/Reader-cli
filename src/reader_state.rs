@@ -396,25 +396,19 @@ impl ReaderState {
                     self.auto_reading
                         .start(chars, is_chapter, first_line.as_deref(), now);
                     let cpm = self.auto_reading.cpm;
+                    let mode_str = self.auto_reading.mode.label();
                     if self.config.discreet_mode {
                         self.agent.receipt = Some(match self.auto_reading.mode {
                             crate::auto_reading::AutoReadingMode::TimedPage => {
-                                format!("Stream pace: {cpm} CPM (Page)").into()
+                                format!("Stream pace: {cpm} CPM ({mode_str})").into()
                             }
                             crate::auto_reading::AutoReadingMode::LineScroll => {
-                                format!("Stream feed: {cpm} CPM (Scroll)").into()
+                                format!("Stream feed: {cpm} CPM ({mode_str})").into()
                             }
                         });
                     } else {
-                        let mode_str = match self.auto_reading.mode {
-                            crate::auto_reading::AutoReadingMode::TimedPage => "Page",
-                            crate::auto_reading::AutoReadingMode::LineScroll => "Scroll",
-                        };
                         self.notify(
-                            format!(
-                                "Auto reading on: {} CPM ({})",
-                                self.auto_reading.cpm, mode_str
-                            ),
+                            format!("Auto reading on: {cpm} CPM ({mode_str})"),
                             NotificationKind::Success,
                         );
                     }
@@ -969,22 +963,21 @@ impl ReaderState {
             return None;
         }
 
-        match self.auto_reading.mode {
-            crate::auto_reading::AutoReadingMode::TimedPage => {
-                if self.auto_reading.is_page_due(now) {
-                    Some(ReaderAction::AutoTick)
-                } else {
-                    None
-                }
-            }
-            crate::auto_reading::AutoReadingMode::LineScroll => {
-                if self.auto_reading.is_line_due(now) {
-                    Some(ReaderAction::AutoTick)
-                } else {
-                    None
-                }
-            }
+        let is_due = match self.auto_reading.mode {
+            crate::auto_reading::AutoReadingMode::TimedPage => self.auto_reading.is_page_due(now),
+            crate::auto_reading::AutoReadingMode::LineScroll => self.auto_reading.is_line_due(now),
+        };
+        is_due.then_some(ReaderAction::AutoTick)
+    }
+
+    fn stop_auto_reading_at_end(&mut self) -> Vec<ReaderEffect> {
+        self.auto_reading.stop();
+        if self.config.discreet_mode {
+            self.agent.receipt = Some("Stream completed".into());
+        } else {
+            self.notify("Reached end of document", NotificationKind::Info);
         }
+        Vec::new()
     }
 
     fn scroll_lines_standard(&mut self, delta: isize) -> Vec<ReaderEffect> {
@@ -1043,13 +1036,7 @@ impl ReaderState {
                     self.current_page + 1 >= self.pages.len()
                 };
                 if at_last {
-                    self.auto_reading.stop();
-                    if self.config.discreet_mode {
-                        self.agent.receipt = Some("Stream completed".into());
-                    } else {
-                        self.notify("Reached end of document", NotificationKind::Info);
-                    }
-                    return Vec::new();
+                    return self.stop_auto_reading_at_end();
                 }
                 let effects = self.move_screen(1);
                 let chars = self.current_page_effective_chars();
@@ -1061,9 +1048,7 @@ impl ReaderState {
                 if self.config.discreet_mode {
                     let view = &self.agent.view;
                     if view.top + 1 >= view.lines.len() {
-                        self.auto_reading.stop();
-                        self.agent.receipt = Some("Stream completed".into());
-                        return Vec::new();
+                        return self.stop_auto_reading_at_end();
                     }
                     let effects = self.scroll_agent(1, false);
                     if let Some(line) = self.current_line_text() {
@@ -1091,12 +1076,9 @@ impl ReaderState {
                         vec![ReaderEffect::SaveProgress(self.current_progress())]
                     } else {
                         if self.current_page + 1 >= self.pages.len() {
-                            self.auto_reading.stop();
-                            self.notify("Reached end of document", NotificationKind::Info);
-                            return Vec::new();
+                            return self.stop_auto_reading_at_end();
                         }
                         self.set_page(self.current_page + 1);
-                        self.line_scroll_offset = 0;
                         if let Some(line) = self.current_line_text() {
                             self.auto_reading.reset_for_line(&line, now);
                         }
@@ -1236,10 +1218,7 @@ impl ReaderState {
                         return self.update(ReaderAction::StopAutoReading);
                     } else if arg == "info" || arg == "status" {
                         let cpm = self.auto_reading.cpm;
-                        let mode_str = match self.auto_reading.mode {
-                            crate::auto_reading::AutoReadingMode::TimedPage => "Page",
-                            crate::auto_reading::AutoReadingMode::LineScroll => "Scroll",
-                        };
+                        let mode_str = self.auto_reading.mode.label();
                         let state_str = if !self.auto_reading.active {
                             "off"
                         } else if self.auto_reading.paused {
@@ -1276,10 +1255,7 @@ impl ReaderState {
                     let arg = arg.trim();
                     if arg.is_empty() {
                         let cpm = self.auto_reading.cpm;
-                        let mode_str = match self.auto_reading.mode {
-                            crate::auto_reading::AutoReadingMode::TimedPage => "Page",
-                            crate::auto_reading::AutoReadingMode::LineScroll => "Scroll",
-                        };
+                        let mode_str = self.auto_reading.mode.label();
                         if self.config.discreet_mode {
                             self.agent.receipt =
                                 Some(format!("Current stream pace: {cpm} CPM ({mode_str})").into());
@@ -1300,10 +1276,7 @@ impl ReaderState {
                 if let Some(arg) = trimmed.strip_prefix("mode") {
                     let arg = arg.trim();
                     if arg.is_empty() {
-                        let mode_str = match self.auto_reading.mode {
-                            crate::auto_reading::AutoReadingMode::TimedPage => "Page",
-                            crate::auto_reading::AutoReadingMode::LineScroll => "Scroll",
-                        };
+                        let mode_str = self.auto_reading.mode.label();
                         if self.config.discreet_mode {
                             self.agent.receipt =
                                 Some(format!("Current stream mode: {mode_str}").into());

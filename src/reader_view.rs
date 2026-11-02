@@ -198,16 +198,11 @@ fn reading_footer_line(state: &ReaderState, palette: Palette) -> Line<'static> {
         ];
         if state.auto_reading.active {
             let cpm = state.auto_reading.cpm;
+            let flag = if state.auto_reading.paused { 'P' } else { 'A' };
             let tag = if width < 42 {
-                if state.auto_reading.paused {
-                    format!(" [P:{cpm}]")
-                } else {
-                    format!(" [A:{cpm}]")
-                }
-            } else if state.auto_reading.paused {
-                format!(" [P: {cpm} CPM]")
+                format!(" [{flag}:{cpm}]")
             } else {
-                format!(" [A: {cpm} CPM]")
+                format!(" [{flag}: {cpm} CPM]")
             };
             spans.push(Span::styled(tag, palette.accent()));
         } else {
@@ -1367,24 +1362,28 @@ fn draw_discreet(frame: &mut ratatui::Frame<'_>, state: &ReaderState, palette: P
     let current_chunk = (start / net_height as usize).saturating_add(1);
     let total_chunks = (total / net_height as usize).max(1);
     let pct = (start * 100 / total.max(1)).min(100);
-    let chunk_label = if state.auto_reading.active {
-        let now = Instant::now();
+    let stream_pace = if state.auto_reading.active {
         let cpm = state.auto_reading.cpm;
         if state.auto_reading.paused {
-            format!("batch {current_chunk}/{total_chunks} ({pct}%) · stream: {cpm} cpm [paused]")
+            Some(format!("stream: {cpm} cpm [paused]"))
         } else {
-            let rem_secs = state.auto_reading.remaining_time(now).as_secs();
+            let rem_secs = state.auto_reading.remaining_time(Instant::now()).as_secs();
             match state.auto_reading.mode {
                 crate::auto_reading::AutoReadingMode::TimedPage => {
-                    format!("batch {current_chunk}/{total_chunks} ({pct}%) · stream: {cpm} cpm ({rem_secs}s)")
+                    Some(format!("stream: {cpm} cpm ({rem_secs}s)"))
                 }
                 crate::auto_reading::AutoReadingMode::LineScroll => {
-                    format!("batch {current_chunk}/{total_chunks} ({pct}%) · stream: {cpm} cpm [scroll]")
+                    Some(format!("stream: {cpm} cpm [scroll]"))
                 }
             }
         }
     } else {
-        format!("batch {current_chunk}/{total_chunks} ({pct}%)")
+        None
+    };
+
+    let chunk_label = match &stream_pace {
+        Some(pace) => format!("batch {current_chunk}/{total_chunks} ({pct}%) · {pace}"),
+        None => format!("batch {current_chunk}/{total_chunks} ({pct}%)"),
     };
 
     let status_hint = match state.agent.receipt.as_deref() {
@@ -1393,23 +1392,10 @@ fn draw_discreet(frame: &mut ratatui::Frame<'_>, state: &ReaderState, palette: P
             "Enter execute · Esc cancel · Tab complete".to_string()
         }
         None if state.agent.help => "j/k scroll · Esc close".to_string(),
-        None if state.auto_reading.active => {
-            let cpm = state.auto_reading.cpm;
-            if state.auto_reading.paused {
-                format!("stream: {cpm} cpm [paused] · :help")
-            } else {
-                let rem_secs = state.auto_reading.remaining_time(Instant::now()).as_secs();
-                match state.auto_reading.mode {
-                    crate::auto_reading::AutoReadingMode::TimedPage => {
-                        format!("stream: {cpm} cpm ({rem_secs}s) · :help")
-                    }
-                    crate::auto_reading::AutoReadingMode::LineScroll => {
-                        format!("stream: {cpm} cpm [scroll] · :help")
-                    }
-                }
-            }
-        }
-        None => ":help · :density · :checkpoint · :fold".to_string(),
+        None => match stream_pace {
+            Some(pace) => format!("{pace} · :help"),
+            None => ":help · :density · :checkpoint · :fold".to_string(),
+        },
     };
 
     let prompt_spans = match &state.agent.command {
