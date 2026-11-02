@@ -1,4 +1,5 @@
 mod atomic_file;
+pub mod auto_reading;
 pub mod book;
 pub mod bookshelf;
 pub mod cli;

@@ -56,6 +56,10 @@ requests removal of the book file, subject to the managed-folder checks in
 | --- | --- |
 | `j` / `Down` / `Space` / `PageDown` | Next screen |
 | `k` / `Up` / `PageUp` | Previous screen |
+| `a` | Start / pause / resume auto reading mode (defaults to 300 CPM timed page turn) |
+| `A` | Stop auto reading |
+| `+` / `=` | Increase auto reading speed (+25 CPM) |
+| `-` | Decrease auto reading speed (-25 CPM) |
 | `g` | Go to a percentage |
 | `Home` | Go to the beginning |
 | `End` / `G` | Go to the end |
@@ -112,19 +116,30 @@ the bookmarks list modal, displaying all saved bookmarks with section title,
 percentage, and text snippet. Navigate with `j`/`k`/arrows, press `Enter` to jump
 to the bookmark, press `d` to delete the selected bookmark, or `Esc` to close.
 
+### Automatic reading and natural speed calibration
+
+Press `a` to start, pause, or resume automatic reading; press `A` (or `:auto off`) to stop. Reader calculates page stay duration dynamically based on the page's actual effective character count ($T = (C / R) \times 60$), with minimum duration protection (3.5s) and chapter buffer bonuses:
+- **Instant pause / resume**: Press `a` at any time to pause or resume automatic reading without competing with page turns.
+- **Pure page navigation**: `Space` is 100% dedicated to flipping to the next screen; pressing `Space` during auto reading advances the screen immediately and resets the timer for the new page.
+- **Speed micro-adjustment**: Press `+` / `=` to speed up or `-` to slow down by 25 CPM.
+- **Manual priority**: Navigating manually (`Space`, `j`/`k`, `PageDown`/`PageUp`, search/bookmark jumps) immediately resets the page timer, ensuring you never compete with automatic page flips.
+- **Speed calibration**: While reading manually, Reader silently tracks page transition cadence. Use `:cal` or `:calibrate` in Agent mode to automatically set your default speed to 90% of your measured median CPM.
+- **Reading modes**: Toggle between timed page turn (`:mode page`, default) and continuous line scrolling (`:mode scroll`).
 
 ## Agent Terminal Mode (current implementation)
 
 Press `p` to toggle Agent Terminal view (or launch directly via `reader -a / --agent <FILE>`).
 
 In Agent Terminal mode:
+- **Authentic engineering simulation**: The terminal presents an authentic coding-agent session (defaulting to a distributed data stream service `data-mesh-service`, reviewing pipeline buffers and Tokio runtimes). All reader metadata, book titles, and reader domain terms (`Reader`, `read_chunk`, `book`) are completely eliminated from headers, banners, footers, and F12 tool outputs.
+- **Configurable simulation context**: Custom workspace, task, and target file can be persisted in `configuration.json` via `agent_workspace`, `agent_task`, and `agent_target`.
 - **High-terminal adaptation**: The header dynamically allocates realistic coding-agent context steps (AST code review, analyzer progress, clippy commands, compiler checks, UAX#14 engine, module scans, and tool traces) based on viewport height, completely eliminating awkward blank space or fixed 4-row truncation in tall terminals.
 - **Customizable simulated rows**:
   - CLI: `reader --agent-lines <N> <FILE>` (or `--discreet-lines <N>`) to override the simulated header line count.
   - Interactive: Type `:lines <N>` to adjust simulated rows dynamically, or `:lines auto` to return to automatic viewport height adaptation.
   - Persistent: Save `agent_lines` in `configuration.json`.
 - **Zero-leakage folding**: Press `F12` to fold visible book text into a neutral session paused state; press again to restore.
-- **Controls**: `j`/`k` scroll 2 lines, `Space`/`PageDown` screen forward with visual overlap, `b` saves checkpoint, `v` toggles density (`Comfortable` / `Inspect`), `:` opens command prompt (`:density`, `:lines`, `:checkpoint`, `:fold`, `:normal`, `:help`, `:quit`).
+- **Controls**: `j`/`k` scroll 2 lines, `Space`/`PageDown` screen forward with visual overlap, `b` saves checkpoint, `v` toggles density (`Comfortable` / `Inspect`), `a` toggles cadence pace (start / pause / resume), `A` stops pace, `:` opens command prompt (`:auto [CPM|off]`, `:pause`, `:resume`, `:stop`, `:cpm <N>`, `:mode <page|scroll>`, `:cal`, `:density`, `:lines`, `:checkpoint`, `:fold`, `:normal`, `:help`, `:quit`).
 
 ## Shelf controls
 

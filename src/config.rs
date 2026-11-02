@@ -23,6 +23,11 @@ pub struct ReaderConfig {
     /// Optional Calibre-Web / Calibre-Web Automated OPDS connection.
     pub network_library: NetworkLibraryConfig,
     pub reading_theme: crate::ui::ReadingTheme,
+    pub agent_workspace: Option<String>,
+    pub agent_task: Option<String>,
+    pub agent_target: Option<String>,
+    pub auto_reading_cpm: Option<u32>,
+    pub auto_reading_mode: crate::auto_reading::AutoReadingMode,
     #[serde(skip)]
     path: Option<PathBuf>,
 }
@@ -42,6 +47,11 @@ impl Default for ReaderConfig {
             bookshelf_dir: None,
             network_library: NetworkLibraryConfig::default(),
             reading_theme: crate::ui::ReadingTheme::Terminal,
+            agent_workspace: None,
+            agent_task: None,
+            agent_target: None,
+            auto_reading_cpm: None,
+            auto_reading_mode: crate::auto_reading::AutoReadingMode::default(),
             path: None,
         }
     }
@@ -132,6 +142,40 @@ impl ReaderConfig {
     pub fn set_reading_theme(&mut self, theme: crate::ui::ReadingTheme) {
         self.reading_theme = theme;
     }
+
+    pub fn agent_workspace(&self) -> &str {
+        self.agent_workspace
+            .as_deref()
+            .unwrap_or("data-mesh-service")
+    }
+
+    pub fn agent_task(&self) -> &str {
+        self.agent_task
+            .as_deref()
+            .unwrap_or("Code Review & Refactor")
+    }
+
+    pub fn agent_target(&self) -> &str {
+        self.agent_target
+            .as_deref()
+            .unwrap_or("crates/core/src/pipeline.rs")
+    }
+
+    pub fn auto_reading_cpm(&self) -> u32 {
+        self.auto_reading_cpm.unwrap_or(300)
+    }
+
+    pub fn set_auto_reading_cpm(&mut self, cpm: u32) {
+        self.auto_reading_cpm = Some(cpm.clamp(60, 2000));
+    }
+
+    pub fn auto_reading_mode(&self) -> crate::auto_reading::AutoReadingMode {
+        self.auto_reading_mode
+    }
+
+    pub fn set_auto_reading_mode(&mut self, mode: crate::auto_reading::AutoReadingMode) {
+        self.auto_reading_mode = mode;
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -150,6 +194,11 @@ struct ReaderConfigWire {
     bookshelf_dir: Option<PathBuf>,
     network_library: NetworkLibraryConfig,
     reading_theme: Option<crate::ui::ReadingTheme>,
+    agent_workspace: Option<String>,
+    agent_task: Option<String>,
+    agent_target: Option<String>,
+    auto_reading_cpm: Option<u32>,
+    auto_reading_mode: Option<crate::auto_reading::AutoReadingMode>,
 }
 
 impl Default for ReaderConfigWire {
@@ -169,6 +218,11 @@ impl Default for ReaderConfigWire {
             bookshelf_dir: config.bookshelf_dir,
             network_library: config.network_library,
             reading_theme: Some(config.reading_theme),
+            agent_workspace: config.agent_workspace,
+            agent_task: config.agent_task,
+            agent_target: config.agent_target,
+            auto_reading_cpm: config.auto_reading_cpm,
+            auto_reading_mode: Some(config.auto_reading_mode),
         }
     }
 }
@@ -192,6 +246,11 @@ impl<'de> serde::Deserialize<'de> for ReaderConfig {
             bookshelf_dir: wire.bookshelf_dir,
             network_library: wire.network_library,
             reading_theme: wire.reading_theme.unwrap_or_default(),
+            agent_workspace: wire.agent_workspace,
+            agent_task: wire.agent_task,
+            agent_target: wire.agent_target,
+            auto_reading_cpm: wire.auto_reading_cpm,
+            auto_reading_mode: wire.auto_reading_mode.unwrap_or_default(),
             path: None,
         })
     }
@@ -339,5 +398,51 @@ mod tests {
 
         let loaded = ReaderConfig::open(path).unwrap();
         assert!(loaded.immersive_mode);
+    }
+
+    #[test]
+    fn agent_workspace_and_task_settings_round_trip() {
+        let legacy: ReaderConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.agent_workspace(), "data-mesh-service");
+        assert_eq!(legacy.agent_task(), "Code Review & Refactor");
+        assert_eq!(legacy.agent_target(), "crates/core/src/pipeline.rs");
+
+        let json = r#"{"agent_workspace":"telemetry-hub","agent_task":"Stream Pipeline Audit","agent_target":"crates/ingest/src/stream.rs"}"#;
+        let config: ReaderConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.agent_workspace(), "telemetry-hub");
+        assert_eq!(config.agent_task(), "Stream Pipeline Audit");
+        assert_eq!(config.agent_target(), "crates/ingest/src/stream.rs");
+
+        let serialized = serde_json::to_string(&config).unwrap();
+        let reloaded: ReaderConfig = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(reloaded.agent_workspace(), "telemetry-hub");
+        assert_eq!(reloaded.agent_task(), "Stream Pipeline Audit");
+        assert_eq!(reloaded.agent_target(), "crates/ingest/src/stream.rs");
+    }
+
+    #[test]
+    fn auto_reading_settings_default_and_round_trip() {
+        let legacy: ReaderConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.auto_reading_cpm(), 300);
+        assert_eq!(
+            legacy.auto_reading_mode(),
+            crate::auto_reading::AutoReadingMode::TimedPage
+        );
+
+        let json = r#"{"auto_reading_cpm":360,"auto_reading_mode":"line_scroll"}"#;
+        let config: ReaderConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.auto_reading_cpm(), 360);
+        assert_eq!(
+            config.auto_reading_mode(),
+            crate::auto_reading::AutoReadingMode::LineScroll
+        );
+
+        let serialized = serde_json::to_string(&config).unwrap();
+        let reloaded: ReaderConfig = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(reloaded.auto_reading_cpm(), 360);
+        assert_eq!(
+            reloaded.auto_reading_mode(),
+            crate::auto_reading::AutoReadingMode::LineScroll
+        );
     }
 }

@@ -33,6 +33,10 @@ pub(crate) enum ReadingCommand {
     Commands,
     ToggleDensity,
     CycleTheme,
+    ToggleAutoReading,
+    StopAutoReading,
+    IncreaseReadingSpeed,
+    DecreaseReadingSpeed,
 }
 
 const PREVIOUS_KEYS: &[KeyChord] = &[
@@ -74,6 +78,13 @@ const RESET_WIDTH_KEYS: &[KeyChord] = &[KeyChord::plain(KeyCode::Char('\\'))];
 const IMMERSIVE_KEYS: &[KeyChord] = &[KeyChord::plain(KeyCode::Char('i'))];
 const OVERLAP_KEYS: &[KeyChord] = &[KeyChord::plain(KeyCode::Char('o'))];
 const THEME_KEYS: &[KeyChord] = &[KeyChord::plain(KeyCode::Char('C'))];
+const AUTO_READING_KEYS: &[KeyChord] = &[KeyChord::plain(KeyCode::Char('a'))];
+const STOP_AUTO_READING_KEYS: &[KeyChord] = &[KeyChord::plain(KeyCode::Char('A'))];
+const INCREASE_SPEED_KEYS: &[KeyChord] = &[
+    KeyChord::plain(KeyCode::Char('+')),
+    KeyChord::plain(KeyCode::Char('=')),
+];
+const DECREASE_SPEED_KEYS: &[KeyChord] = &[KeyChord::plain(KeyCode::Char('-'))];
 
 pub(crate) const READING_BINDINGS: &[KeyBinding<ReadingCommand>] = &[
     KeyBinding {
@@ -316,9 +327,89 @@ pub(crate) const READING_BINDINGS: &[KeyBinding<ReadingCommand>] = &[
         show_in_hud: true,
         hud_priority: 1,
     },
+    KeyBinding {
+        command: ReadingCommand::ToggleAutoReading,
+        chords: AUTO_READING_KEYS,
+        keys: "a",
+        hud_keys: "a",
+        label: "Start / pause / resume auto reading",
+        short_label: "Auto",
+        show_in_hud: true,
+        hud_priority: 1,
+    },
+    KeyBinding {
+        command: ReadingCommand::StopAutoReading,
+        chords: STOP_AUTO_READING_KEYS,
+        keys: "A",
+        hud_keys: "A",
+        label: "Stop auto reading",
+        short_label: "Stop",
+        show_in_hud: false,
+        hud_priority: 2,
+    },
+    KeyBinding {
+        command: ReadingCommand::IncreaseReadingSpeed,
+        chords: INCREASE_SPEED_KEYS,
+        keys: "+ / =",
+        hud_keys: "+",
+        label: "Increase auto reading speed (+25 CPM)",
+        short_label: "Faster",
+        show_in_hud: false,
+        hud_priority: 2,
+    },
+    KeyBinding {
+        command: ReadingCommand::DecreaseReadingSpeed,
+        chords: DECREASE_SPEED_KEYS,
+        keys: "-",
+        hud_keys: "-",
+        label: "Decrease auto reading speed (-25 CPM)",
+        short_label: "Slower",
+        show_in_hud: false,
+        hud_priority: 2,
+    },
 ];
 
 pub(crate) const DISCREET_BINDINGS: &[KeyBinding<ReadingCommand>] = &[
+    KeyBinding {
+        command: ReadingCommand::ToggleAutoReading,
+        chords: AUTO_READING_KEYS,
+        keys: "a",
+        hud_keys: "a",
+        label: "Stream cadence pace (start / pause / resume)",
+        short_label: "Pace",
+        show_in_hud: true,
+        hud_priority: 1,
+    },
+    KeyBinding {
+        command: ReadingCommand::StopAutoReading,
+        chords: STOP_AUTO_READING_KEYS,
+        keys: "A",
+        hud_keys: "A",
+        label: "Stop stream cadence pace",
+        short_label: "Stop",
+        show_in_hud: false,
+        hud_priority: 2,
+    },
+    KeyBinding {
+        command: ReadingCommand::IncreaseReadingSpeed,
+        chords: INCREASE_SPEED_KEYS,
+        keys: "+ / =",
+        hud_keys: "+",
+        label: "Increase cadence pace (+25 tpm)",
+        short_label: "Faster",
+        show_in_hud: false,
+        hud_priority: 2,
+    },
+    KeyBinding {
+        command: ReadingCommand::DecreaseReadingSpeed,
+        chords: DECREASE_SPEED_KEYS,
+        keys: "-",
+        hud_keys: "-",
+        label: "Decrease cadence pace (-25 tpm)",
+        short_label: "Slower",
+        show_in_hud: false,
+        hud_priority: 2,
+    },
     KeyBinding {
         command: ReadingCommand::ScrollUp,
         chords: &[
@@ -515,6 +606,12 @@ pub(crate) const LOCAL_COMMANDS: &[(&str, ReaderAction)] = &[
     ("prev", ReaderAction::PreviousScreen),
     ("down", ReaderAction::ScrollLines(2)),
     ("up", ReaderAction::ScrollLines(-2)),
+    ("auto", ReaderAction::ToggleAutoReading),
+    ("pause", ReaderAction::ToggleAutoReadingPause),
+    ("resume", ReaderAction::ToggleAutoReadingPause),
+    ("stop", ReaderAction::StopAutoReading),
+    ("cal", ReaderAction::CalibrateReadingSpeed),
+    ("calibrate", ReaderAction::CalibrateReadingSpeed),
     ("checkpoint", ReaderAction::AddBookmark),
     ("density", ReaderAction::ToggleDensity),
     ("lines", ReaderAction::SetAgentLines(None)),
@@ -636,6 +733,10 @@ fn command_action(command: ReadingCommand) -> ReaderAction {
         ReadingCommand::TogglePageOverlap => ReaderAction::TogglePageOverlap,
         ReadingCommand::ToggleDensity => ReaderAction::ToggleDensity,
         ReadingCommand::CycleTheme => ReaderAction::CycleTheme,
+        ReadingCommand::ToggleAutoReading => ReaderAction::ToggleAutoReading,
+        ReadingCommand::StopAutoReading => ReaderAction::StopAutoReading,
+        ReadingCommand::IncreaseReadingSpeed => ReaderAction::AdjustAutoReadingSpeed(25),
+        ReadingCommand::DecreaseReadingSpeed => ReaderAction::AdjustAutoReadingSpeed(-25),
     }
 }
 
@@ -909,6 +1010,47 @@ mod tests {
         assert_eq!(
             action_for_key(KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE), &s),
             ReaderAction::ToggleHidden
+        );
+    }
+
+    #[test]
+    fn auto_reading_key_bindings_and_space_preserves_page_turn() {
+        let mut s = state();
+        // Inactive: Space goes to next screen
+        assert_eq!(
+            action_for_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &s),
+            ReaderAction::NextScreen
+        );
+        // 'a' starts auto reading (or pauses/resumes)
+        assert_eq!(
+            action_for_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE), &s),
+            ReaderAction::ToggleAutoReading
+        );
+        // 'A' stops auto reading
+        assert_eq!(
+            action_for_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::NONE), &s),
+            ReaderAction::StopAutoReading
+        );
+        // '+' and '=' increase speed
+        assert_eq!(
+            action_for_key(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE), &s),
+            ReaderAction::AdjustAutoReadingSpeed(25)
+        );
+        assert_eq!(
+            action_for_key(KeyEvent::new(KeyCode::Char('='), KeyModifiers::NONE), &s),
+            ReaderAction::AdjustAutoReadingSpeed(25)
+        );
+        // '-' decreases speed
+        assert_eq!(
+            action_for_key(KeyEvent::new(KeyCode::Char('-'), KeyModifiers::NONE), &s),
+            ReaderAction::AdjustAutoReadingSpeed(-25)
+        );
+
+        // Even with auto reading active, Space remains 100% pure NextScreen!
+        s.auto_reading.active = true;
+        assert_eq!(
+            action_for_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &s),
+            ReaderAction::NextScreen
         );
     }
 }

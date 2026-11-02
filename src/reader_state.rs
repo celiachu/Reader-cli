@@ -28,6 +28,8 @@ pub(crate) struct ReaderState {
     pub config: ReaderConfig,
     pub hidden: bool,
     pub agent: AgentSession,
+    pub auto_reading: crate::auto_reading::AutoReadingState,
+    pub line_scroll_offset: usize,
 }
 
 #[derive(Debug, Default)]
@@ -131,6 +133,14 @@ pub(crate) enum ReaderAction {
     CycleTheme,
     #[allow(dead_code)]
     SetReadingTheme(crate::ui::ReadingTheme),
+    ToggleAutoReading,
+    ToggleAutoReadingPause,
+    StopAutoReading,
+    AdjustAutoReadingSpeed(i32),
+    SetAutoReadingSpeed(u32),
+    SetAutoReadingMode(crate::auto_reading::AutoReadingMode),
+    CalibrateReadingSpeed,
+    AutoTick,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,6 +172,10 @@ impl ReaderState {
         let position = metrics.clamp(saved.position);
         let pages = paginate_for_config(&document, viewport, &config);
         let current_page = page_for_position(&pages, position);
+        let auto_reading = crate::auto_reading::AutoReadingState::new(
+            config.auto_reading_cpm(),
+            config.auto_reading_mode(),
+        );
         let mut state = Self {
             document,
             book_id,
@@ -179,8 +193,15 @@ impl ReaderState {
             config,
             hidden: false,
             agent: AgentSession::default(),
+            auto_reading,
+            line_scroll_offset: 0,
         };
         state.reflow_agent();
+        let chars = state.current_page_effective_chars();
+        state
+            .auto_reading
+            .calibration
+            .on_page_entered(chars, Instant::now());
         if state.config.discreet_mode {
             state.agent.record_read(ReadDirection::Current);
         }
@@ -300,7 +321,18 @@ impl ReaderState {
 
         match action {
             ReaderAction::None => Vec::new(),
-            ReaderAction::ScrollLines(delta) => self.scroll_agent(delta, false),
+            ReaderAction::ScrollLines(delta) => {
+                let effects = if self.config.discreet_mode {
+                    self.scroll_agent(delta, false)
+                } else {
+                    self.scroll_lines_standard(delta)
+                };
+                if self.auto_reading.active {
+                    let now = Instant::now();
+                    self.reset_auto_reading_for_current_page(now);
+                }
+                effects
+            }
             ReaderAction::OpenCommand => {
                 self.agent.command = Some(String::new());
                 Vec::new()
@@ -310,10 +342,13 @@ impl ReaderState {
                 if self.config.discreet_mode {
                     self.agent.density = self.agent.density.toggle();
                     self.reflow_agent();
-                    self.agent.receipt = Some(match self.agent.density {
-                        AgentDensity::Comfortable => "Density: comfortable",
-                        AgentDensity::Inspect => "Density: inspect",
-                    });
+                    self.agent.receipt = Some(
+                        match self.agent.density {
+                            AgentDensity::Comfortable => "Density: comfortable",
+                            AgentDensity::Inspect => "Density: inspect",
+                        }
+                        .into(),
+                    );
                 }
                 Vec::new()
             }
@@ -321,24 +356,214 @@ impl ReaderState {
                 if self.config.discreet_mode {
                     self.config.agent_lines = lines;
                     self.reflow_agent();
-                    self.agent.receipt = Some(match lines {
-                        Some(_) => "Agent rows updated",
-                        None => "Agent rows: auto",
-                    });
+                    self.agent.receipt = Some(
+                        match lines {
+                            Some(_) => "Agent rows updated",
+                            None => "Agent rows: auto",
+                        }
+                        .into(),
+                    );
                     vec![ReaderEffect::SaveConfig]
                 } else {
                     Vec::new()
                 }
             }
             ReaderAction::Exit => vec![ReaderEffect::Exit],
-            ReaderAction::NextScreen => self.move_screen(1),
-            ReaderAction::PreviousScreen => self.move_screen(-1),
+            ReaderAction::NextScreen => {
+                let now = Instant::now();
+                self.record_manual_page_turn(now);
+                let effects = self.move_screen(1);
+                if self.auto_reading.active {
+                    self.reset_auto_reading_for_current_page(now);
+                }
+                effects
+            }
+            ReaderAction::PreviousScreen => {
+                let now = Instant::now();
+                self.record_manual_page_turn(now);
+                let effects = self.move_screen(-1);
+                if self.auto_reading.active {
+                    self.reset_auto_reading_for_current_page(now);
+                }
+                effects
+            }
+            ReaderAction::ToggleAutoReading => {
+                let now = Instant::now();
+                if !self.auto_reading.active {
+                    let chars = self.current_page_effective_chars();
+                    let is_chapter = self.is_current_page_chapter_start();
+                    let first_line = self.current_line_text();
+                    self.auto_reading
+                        .start(chars, is_chapter, first_line.as_deref(), now);
+                    let cpm = self.auto_reading.cpm;
+                    if self.config.discreet_mode {
+                        self.agent.receipt = Some(match self.auto_reading.mode {
+                            crate::auto_reading::AutoReadingMode::TimedPage => {
+                                format!("Stream pace: {cpm} CPM (Page)").into()
+                            }
+                            crate::auto_reading::AutoReadingMode::LineScroll => {
+                                format!("Stream feed: {cpm} CPM (Scroll)").into()
+                            }
+                        });
+                    } else {
+                        let mode_str = match self.auto_reading.mode {
+                            crate::auto_reading::AutoReadingMode::TimedPage => "Page",
+                            crate::auto_reading::AutoReadingMode::LineScroll => "Scroll",
+                        };
+                        self.notify(
+                            format!(
+                                "Auto reading on: {} CPM ({})",
+                                self.auto_reading.cpm, mode_str
+                            ),
+                            NotificationKind::Success,
+                        );
+                    }
+                    Vec::new()
+                } else {
+                    self.update(ReaderAction::ToggleAutoReadingPause)
+                }
+            }
+            ReaderAction::ToggleAutoReadingPause => {
+                let now = Instant::now();
+                if !self.auto_reading.active {
+                    return self.update(ReaderAction::ToggleAutoReading);
+                }
+                let paused = self.auto_reading.toggle_pause(now);
+                let cpm = self.auto_reading.cpm;
+                if self.config.discreet_mode {
+                    self.agent.receipt = Some(if paused {
+                        format!("Stream pace: paused ({cpm} CPM)").into()
+                    } else {
+                        format!("Stream pace: {cpm} CPM").into()
+                    });
+                } else {
+                    self.notify(
+                        if paused {
+                            format!("Auto reading paused · {cpm} CPM (Press a to resume)")
+                        } else {
+                            format!("Auto reading resumed · {cpm} CPM")
+                        },
+                        NotificationKind::Info,
+                    );
+                }
+                Vec::new()
+            }
+            ReaderAction::StopAutoReading => {
+                if self.auto_reading.active {
+                    self.auto_reading.stop();
+                    if self.config.discreet_mode {
+                        self.agent.receipt = Some("Stream pace: off".into());
+                    } else {
+                        self.notify("Auto reading stopped", NotificationKind::Info);
+                    }
+                }
+                Vec::new()
+            }
+            ReaderAction::AdjustAutoReadingSpeed(delta) => {
+                let now = Instant::now();
+                let chars = self.current_page_effective_chars();
+                let is_chapter = self.is_current_page_chapter_start();
+                let new_cpm = self.auto_reading.adjust_cpm(delta, chars, is_chapter, now);
+                self.config.set_auto_reading_cpm(new_cpm);
+                if self.config.discreet_mode {
+                    self.agent.receipt = Some(format!("Stream pace: {new_cpm} CPM").into());
+                } else {
+                    self.notify(
+                        format!("Reading speed: {new_cpm} CPM"),
+                        NotificationKind::Info,
+                    );
+                }
+                vec![ReaderEffect::SaveConfig]
+            }
+            ReaderAction::SetAutoReadingSpeed(cpm) => {
+                let now = Instant::now();
+                let chars = self.current_page_effective_chars();
+                let is_chapter = self.is_current_page_chapter_start();
+                self.auto_reading.set_cpm(cpm, chars, is_chapter, now);
+                self.config.set_auto_reading_cpm(cpm);
+                if self.config.discreet_mode {
+                    self.agent.receipt = Some(format!("Stream pace: {cpm} CPM").into());
+                } else {
+                    self.notify(
+                        format!("Reading speed set: {cpm} CPM"),
+                        NotificationKind::Info,
+                    );
+                }
+                vec![ReaderEffect::SaveConfig]
+            }
+            ReaderAction::SetAutoReadingMode(mode) => {
+                let now = Instant::now();
+                self.auto_reading.mode = mode;
+                self.config.set_auto_reading_mode(mode);
+                let chars = self.current_page_effective_chars();
+                let is_chapter = self.is_current_page_chapter_start();
+                self.auto_reading.reset_for_page(chars, is_chapter, now);
+                if let Some(line) = self.current_line_text() {
+                    self.auto_reading.reset_for_line(&line, now);
+                }
+                if self.config.discreet_mode {
+                    self.agent.receipt = Some(format!("Stream mode: {}", mode.label()).into());
+                } else {
+                    self.notify(
+                        format!("Auto reading mode: {}", mode.label()),
+                        NotificationKind::Info,
+                    );
+                }
+                vec![ReaderEffect::SaveConfig]
+            }
+            ReaderAction::CalibrateReadingSpeed => {
+                let now = Instant::now();
+                let chars = self.current_page_effective_chars();
+                let is_chapter = self.is_current_page_chapter_start();
+                match self
+                    .auto_reading
+                    .apply_calibrated_cpm(chars, is_chapter, now)
+                {
+                    Some(calibrated_cpm) => {
+                        self.config.set_auto_reading_cpm(calibrated_cpm);
+                        let count = self.auto_reading.calibration.sample_count();
+                        if self.config.discreet_mode {
+                            self.agent.receipt = Some(
+                                format!("Stream cadence calibrated: {calibrated_cpm} CPM").into(),
+                            );
+                        } else {
+                            self.notify(
+                                format!("Calibrated reading speed: {calibrated_cpm} CPM (from {count} pages)"),
+                                NotificationKind::Success,
+                            );
+                        }
+                        vec![ReaderEffect::SaveConfig]
+                    }
+                    None => {
+                        let count = self.auto_reading.calibration.sample_count();
+                        if self.config.discreet_mode {
+                            self.agent.receipt =
+                                Some("Calibration requires manual reading samples".into());
+                        } else {
+                            self.notify(
+                                format!(
+                                    "Need 2-3 manually read pages to calibrate (currently {count})"
+                                ),
+                                NotificationKind::Info,
+                            );
+                        }
+                        Vec::new()
+                    }
+                }
+            }
+            ReaderAction::AutoTick => self.handle_auto_tick(),
             ReaderAction::JumpStart => match &mut self.overlay {
                 Overlay::Bookmarks(navigator) => {
                     navigator.selection = 0;
                     Vec::new()
                 }
-                _ => self.jump_boundary(false),
+                _ => {
+                    let effects = self.jump_boundary(false);
+                    if self.auto_reading.active {
+                        self.reset_auto_reading_for_current_page(Instant::now());
+                    }
+                    effects
+                }
             },
             ReaderAction::JumpEnd => match &mut self.overlay {
                 Overlay::Bookmarks(navigator) => {
@@ -347,7 +572,13 @@ impl ReaderState {
                     }
                     Vec::new()
                 }
-                _ => self.jump_boundary(true),
+                _ => {
+                    let effects = self.jump_boundary(true);
+                    if self.auto_reading.active {
+                        self.reset_auto_reading_for_current_page(Instant::now());
+                    }
+                    effects
+                }
             },
             ReaderAction::OpenPercent => {
                 self.overlay = Overlay::Percent(PercentNavigator::default());
@@ -446,8 +677,12 @@ impl ReaderState {
                 self.agent.command = None;
                 self.agent.help = false;
                 self.notification = None;
+                let now = Instant::now();
                 if self.hidden {
                     self.agent.receipt = None;
+                    self.auto_reading.pause(now);
+                } else {
+                    self.auto_reading.resume(now);
                 }
                 if !self.hidden {
                     self.repaginate();
@@ -642,19 +877,234 @@ impl ReaderState {
         if let Some(page) = self.pages.get(self.current_page) {
             self.position = page.source_start;
         }
+        self.line_scroll_offset = 0;
         self.reflow_agent();
     }
 
     fn jump_to_position(&mut self, position: TextPosition) {
         self.position = self.metrics.clamp(position);
         self.current_page = page_for_position(&self.pages, self.position);
+        self.line_scroll_offset = 0;
         self.reflow_agent();
     }
 
     fn repaginate(&mut self) {
         self.pages = paginate_for_config(&self.document, self.viewport, &self.config);
         self.current_page = page_for_position(&self.pages, self.position);
+        self.line_scroll_offset = 0;
         self.reflow_agent();
+        let now = Instant::now();
+        if self.auto_reading.active {
+            self.reset_auto_reading_for_current_page(now);
+        }
+    }
+
+    pub fn current_page_effective_chars(&self) -> usize {
+        if self.config.discreet_mode {
+            let height = u16::try_from(self.agent_body_height()).unwrap_or(u16::MAX);
+            let visible = self.agent.view.visible(height);
+            let lines: Vec<String> = visible.iter().map(|vl| vl.line.text.clone()).collect();
+            crate::auto_reading::count_effective_reading_chars(&lines, self.agent.view.context_rows)
+        } else {
+            self.pages
+                .get(self.current_page)
+                .map(|p| {
+                    crate::auto_reading::count_effective_reading_chars(&p.lines, p.overlap_lines)
+                })
+                .unwrap_or(0)
+        }
+    }
+
+    pub fn is_current_page_chapter_start(&self) -> bool {
+        if self.config.discreet_mode {
+            self.agent.view.top == 0 || self.position.char_offset == 0
+        } else {
+            self.current_page == 0
+                || self
+                    .pages
+                    .get(self.current_page)
+                    .map(|p| p.source_start.char_offset == 0)
+                    .unwrap_or(false)
+        }
+    }
+
+    pub fn current_line_text(&self) -> Option<String> {
+        if self.config.discreet_mode {
+            self.agent
+                .view
+                .lines
+                .get(self.agent.view.top)
+                .map(|vl| vl.line.text.clone())
+        } else {
+            self.pages
+                .get(self.current_page)
+                .and_then(|p| p.lines.get(self.line_scroll_offset))
+                .cloned()
+        }
+    }
+
+    pub fn record_manual_page_turn(&mut self, now: Instant) {
+        let chars = self.current_page_effective_chars();
+        self.auto_reading.calibration.on_manual_page_turn(now);
+        self.auto_reading.calibration.on_page_entered(chars, now);
+    }
+
+    pub fn reset_auto_reading_for_current_page(&mut self, now: Instant) {
+        let chars = self.current_page_effective_chars();
+        let is_chapter = self.is_current_page_chapter_start();
+        self.auto_reading.reset_for_page(chars, is_chapter, now);
+        if let Some(line) = self.current_line_text() {
+            self.auto_reading.reset_for_line(&line, now);
+        }
+    }
+
+    pub fn auto_reading_tick(&mut self, now: Instant) -> Option<ReaderAction> {
+        if self.hidden
+            || !matches!(self.overlay, Overlay::None)
+            || self.agent.command.is_some()
+            || self.agent.help
+            || !self.auto_reading.active
+            || self.auto_reading.paused
+        {
+            return None;
+        }
+
+        match self.auto_reading.mode {
+            crate::auto_reading::AutoReadingMode::TimedPage => {
+                if self.auto_reading.is_page_due(now) {
+                    Some(ReaderAction::AutoTick)
+                } else {
+                    None
+                }
+            }
+            crate::auto_reading::AutoReadingMode::LineScroll => {
+                if self.auto_reading.is_line_due(now) {
+                    Some(ReaderAction::AutoTick)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    fn scroll_lines_standard(&mut self, delta: isize) -> Vec<ReaderEffect> {
+        if self.pages.is_empty() {
+            return Vec::new();
+        }
+        let current_page_lines = self
+            .pages
+            .get(self.current_page)
+            .map(|p| p.lines.len())
+            .unwrap_or(0);
+        let new_offset = self.line_scroll_offset as isize + delta;
+        if new_offset < 0 {
+            if self.current_page > 0 {
+                self.current_page -= 1;
+                let prev_page_lines = self
+                    .pages
+                    .get(self.current_page)
+                    .map(|p| p.lines.len())
+                    .unwrap_or(1);
+                self.line_scroll_offset = (prev_page_lines as isize + new_offset).max(0) as usize;
+            } else {
+                self.line_scroll_offset = 0;
+            }
+        } else if new_offset >= current_page_lines as isize {
+            if self.current_page + 1 < self.pages.len() {
+                self.current_page += 1;
+                self.line_scroll_offset =
+                    (new_offset - current_page_lines as isize).max(0) as usize;
+            } else {
+                self.line_scroll_offset = current_page_lines.saturating_sub(1);
+            }
+        } else {
+            self.line_scroll_offset = new_offset as usize;
+        }
+
+        if let Some(page) = self.pages.get(self.current_page) {
+            if let Some(anchored) = page.anchored_lines.get(self.line_scroll_offset) {
+                self.position = TextPosition::new(page.section_index, anchored.start_char);
+            } else {
+                self.position = page.source_start;
+            }
+        }
+        vec![ReaderEffect::SaveProgress(self.current_progress())]
+    }
+
+    fn handle_auto_tick(&mut self) -> Vec<ReaderEffect> {
+        let now = Instant::now();
+        match self.auto_reading.mode {
+            crate::auto_reading::AutoReadingMode::TimedPage => {
+                let at_last = if self.config.discreet_mode {
+                    let height = self.agent_body_height();
+                    let view = &self.agent.view;
+                    view.top.saturating_add(height) >= view.lines.len()
+                } else {
+                    self.current_page + 1 >= self.pages.len()
+                };
+                if at_last {
+                    self.auto_reading.stop();
+                    if self.config.discreet_mode {
+                        self.agent.receipt = Some("Stream completed".into());
+                    } else {
+                        self.notify("Reached end of document", NotificationKind::Info);
+                    }
+                    return Vec::new();
+                }
+                let effects = self.move_screen(1);
+                let chars = self.current_page_effective_chars();
+                let is_chapter = self.is_current_page_chapter_start();
+                self.auto_reading.reset_for_page(chars, is_chapter, now);
+                effects
+            }
+            crate::auto_reading::AutoReadingMode::LineScroll => {
+                if self.config.discreet_mode {
+                    let view = &self.agent.view;
+                    if view.top + 1 >= view.lines.len() {
+                        self.auto_reading.stop();
+                        self.agent.receipt = Some("Stream completed".into());
+                        return Vec::new();
+                    }
+                    let effects = self.scroll_agent(1, false);
+                    if let Some(line) = self.current_line_text() {
+                        self.auto_reading.reset_for_line(&line, now);
+                    }
+                    effects
+                } else {
+                    let page_line_count = self
+                        .pages
+                        .get(self.current_page)
+                        .map(|p| p.lines.len())
+                        .unwrap_or(0);
+                    if self.line_scroll_offset + 1 < page_line_count {
+                        self.line_scroll_offset += 1;
+                        if let Some(line) = self.current_line_text() {
+                            self.auto_reading.reset_for_line(&line, now);
+                        }
+                        if let Some(page) = self.pages.get(self.current_page) {
+                            if let Some(anchored) = page.anchored_lines.get(self.line_scroll_offset)
+                            {
+                                self.position =
+                                    TextPosition::new(page.section_index, anchored.start_char);
+                            }
+                        }
+                        vec![ReaderEffect::SaveProgress(self.current_progress())]
+                    } else {
+                        if self.current_page + 1 >= self.pages.len() {
+                            self.auto_reading.stop();
+                            self.notify("Reached end of document", NotificationKind::Info);
+                            return Vec::new();
+                        }
+                        self.set_page(self.current_page + 1);
+                        self.line_scroll_offset = 0;
+                        if let Some(line) = self.current_line_text() {
+                            self.auto_reading.reset_for_line(&line, now);
+                        }
+                        vec![ReaderEffect::SaveProgress(self.current_progress())]
+                    }
+                }
+            }
+        }
     }
 
     fn reflow_agent(&mut self) {
@@ -774,7 +1224,106 @@ impl ReaderState {
                     } else if let Ok(n) = arg.parse::<u16>() {
                         return self.update(ReaderAction::SetAgentLines(Some(n)));
                     } else {
-                        self.agent.receipt = Some("Usage: :lines <N> or :lines auto");
+                        self.agent.receipt = Some("Usage: :lines <N> or :lines auto".into());
+                        return Vec::new();
+                    }
+                }
+                if let Some(arg) = trimmed.strip_prefix("auto") {
+                    let arg = arg.trim();
+                    if arg.is_empty() {
+                        return self.update(ReaderAction::ToggleAutoReading);
+                    } else if arg == "off" || arg == "stop" {
+                        return self.update(ReaderAction::StopAutoReading);
+                    } else if arg == "info" || arg == "status" {
+                        let cpm = self.auto_reading.cpm;
+                        let mode_str = match self.auto_reading.mode {
+                            crate::auto_reading::AutoReadingMode::TimedPage => "Page",
+                            crate::auto_reading::AutoReadingMode::LineScroll => "Scroll",
+                        };
+                        let state_str = if !self.auto_reading.active {
+                            "off"
+                        } else if self.auto_reading.paused {
+                            "paused"
+                        } else {
+                            "active"
+                        };
+                        if self.config.discreet_mode {
+                            self.agent.receipt = Some(
+                                format!("Stream pace: {cpm} CPM ({mode_str} · {state_str})").into(),
+                            );
+                        } else {
+                            self.notify(
+                                format!("Auto reading: {cpm} CPM ({mode_str} · {state_str})"),
+                                NotificationKind::Info,
+                            );
+                        }
+                        return Vec::new();
+                    } else if let Ok(cpm) = arg.parse::<u32>() {
+                        self.update(ReaderAction::SetAutoReadingSpeed(cpm));
+                        if !self.auto_reading.active {
+                            return self.update(ReaderAction::ToggleAutoReading);
+                        }
+                        return Vec::new();
+                    } else {
+                        self.agent.receipt = Some("Usage: :auto [CPM|off|status]".into());
+                        return Vec::new();
+                    }
+                }
+                if let Some(arg) = trimmed
+                    .strip_prefix("cpm")
+                    .or_else(|| trimmed.strip_prefix("speed"))
+                {
+                    let arg = arg.trim();
+                    if arg.is_empty() {
+                        let cpm = self.auto_reading.cpm;
+                        let mode_str = match self.auto_reading.mode {
+                            crate::auto_reading::AutoReadingMode::TimedPage => "Page",
+                            crate::auto_reading::AutoReadingMode::LineScroll => "Scroll",
+                        };
+                        if self.config.discreet_mode {
+                            self.agent.receipt =
+                                Some(format!("Current stream pace: {cpm} CPM ({mode_str})").into());
+                        } else {
+                            self.notify(
+                                format!("Current reading speed: {cpm} CPM ({mode_str})"),
+                                NotificationKind::Info,
+                            );
+                        }
+                        return Vec::new();
+                    } else if let Ok(cpm) = arg.parse::<u32>() {
+                        return self.update(ReaderAction::SetAutoReadingSpeed(cpm));
+                    } else {
+                        self.agent.receipt = Some("Usage: :cpm [number]".into());
+                        return Vec::new();
+                    }
+                }
+                if let Some(arg) = trimmed.strip_prefix("mode") {
+                    let arg = arg.trim();
+                    if arg.is_empty() {
+                        let mode_str = match self.auto_reading.mode {
+                            crate::auto_reading::AutoReadingMode::TimedPage => "Page",
+                            crate::auto_reading::AutoReadingMode::LineScroll => "Scroll",
+                        };
+                        if self.config.discreet_mode {
+                            self.agent.receipt =
+                                Some(format!("Current stream mode: {mode_str}").into());
+                        } else {
+                            self.notify(
+                                format!("Current auto reading mode: {mode_str}"),
+                                NotificationKind::Info,
+                            );
+                        }
+                        return Vec::new();
+                    } else if arg == "page" {
+                        return self.update(ReaderAction::SetAutoReadingMode(
+                            crate::auto_reading::AutoReadingMode::TimedPage,
+                        ));
+                    } else if arg == "scroll" || arg == "line" {
+                        return self.update(ReaderAction::SetAutoReadingMode(
+                            crate::auto_reading::AutoReadingMode::LineScroll,
+                        ));
+                    } else {
+                        self.agent.receipt = Some("Usage: :mode <page|scroll>".into());
                         return Vec::new();
                     }
                 }
@@ -785,7 +1334,7 @@ impl ReaderState {
                 if let Some(action) = action {
                     return self.update(action);
                 }
-                self.agent.receipt = Some("Unknown local command · :help");
+                self.agent.receipt = Some("Unknown local command · :help".into());
             }
             _ => {}
         }
@@ -1124,6 +1673,14 @@ fn action_is_available_in_discreet(action: ReaderAction) -> bool {
             | ReaderAction::SetAgentLines(_)
             | ReaderAction::CycleTheme
             | ReaderAction::SetReadingTheme(_)
+            | ReaderAction::ToggleAutoReading
+            | ReaderAction::ToggleAutoReadingPause
+            | ReaderAction::StopAutoReading
+            | ReaderAction::AdjustAutoReadingSpeed(_)
+            | ReaderAction::SetAutoReadingSpeed(_)
+            | ReaderAction::SetAutoReadingMode(_)
+            | ReaderAction::CalibrateReadingSpeed
+            | ReaderAction::AutoTick
     )
 }
 
@@ -1511,7 +2068,10 @@ mod tests {
             s.update(ReaderAction::Input(ch));
         }
         s.update(ReaderAction::Confirm);
-        assert_eq!(s.agent.receipt, Some("Unknown local command · :help"));
+        assert_eq!(
+            s.agent.receipt.as_deref(),
+            Some("Unknown local command · :help")
+        );
         s.update(ReaderAction::OpenCommand);
         for _ in 0..100 {
             s.update(ReaderAction::Input('x'));
@@ -1807,5 +2367,193 @@ mod tests {
             .unwrap()
             .text
             .contains("Nord Dark"));
+    }
+
+    #[test]
+    fn auto_reading_page_mode_workflow_and_tick() {
+        let mut state = state();
+        assert!(!state.auto_reading.active);
+
+        // Turn on auto reading
+        state.update(ReaderAction::ToggleAutoReading);
+        assert!(state.auto_reading.active);
+        assert!(!state.auto_reading.paused);
+        assert_eq!(state.auto_reading.cpm, 300);
+        assert_eq!(state.current_page, 0);
+
+        // Advance tick: should move to page 1
+        let effects = state.update(ReaderAction::AutoTick);
+        assert_eq!(state.current_page, 1);
+        assert!(effects
+            .iter()
+            .any(|e| matches!(e, ReaderEffect::SaveProgress(_))));
+
+        // When reaching the end, it gracefully deactivates
+        while state.current_page + 1 < state.pages.len() {
+            state.update(ReaderAction::AutoTick);
+        }
+        assert_eq!(state.current_page, state.pages.len() - 1);
+        // Next tick at the end stops auto reading
+        state.update(ReaderAction::AutoTick);
+        assert!(!state.auto_reading.active);
+    }
+
+    #[test]
+    fn auto_reading_pause_resume_and_speed_adjust() {
+        let mut state = state();
+        state.update(ReaderAction::ToggleAutoReading);
+        assert!(state.auto_reading.active && !state.auto_reading.paused);
+
+        // 'a' (ToggleAutoReading) pauses when active
+        state.update(ReaderAction::ToggleAutoReading);
+        assert!(state.auto_reading.paused);
+
+        // 'a' resumes when paused
+        state.update(ReaderAction::ToggleAutoReading);
+        assert!(!state.auto_reading.paused);
+
+        // Adjust speed
+        let effects = state.update(ReaderAction::AdjustAutoReadingSpeed(50));
+        assert_eq!(effects, vec![ReaderEffect::SaveConfig]);
+        assert_eq!(state.auto_reading.cpm, 350);
+        assert_eq!(state.config.auto_reading_cpm(), 350);
+
+        // Set speed directly
+        state.update(ReaderAction::SetAutoReadingSpeed(400));
+        assert_eq!(state.auto_reading.cpm, 400);
+        assert_eq!(state.config.auto_reading_cpm(), 400);
+
+        // Stop auto reading via StopAutoReading
+        state.update(ReaderAction::StopAutoReading);
+        assert!(!state.auto_reading.active);
+    }
+
+    #[test]
+    fn auto_reading_line_scroll_mode() {
+        let mut state = state();
+        state.update(ReaderAction::SetAutoReadingMode(
+            crate::auto_reading::AutoReadingMode::LineScroll,
+        ));
+        assert_eq!(
+            state.auto_reading.mode,
+            crate::auto_reading::AutoReadingMode::LineScroll
+        );
+        state.update(ReaderAction::ToggleAutoReading);
+        assert!(state.auto_reading.active);
+
+        // Initial line offset is 0
+        assert_eq!(state.line_scroll_offset, 0);
+
+        // Auto tick advances line offset
+        state.update(ReaderAction::AutoTick);
+        assert_eq!(state.line_scroll_offset, 1);
+    }
+
+    #[test]
+    fn auto_reading_calibration_flow() {
+        let mut state = state();
+        // Calibrate with no samples: informs user
+        state.update(ReaderAction::CalibrateReadingSpeed);
+        assert!(state
+            .notification
+            .as_ref()
+            .unwrap()
+            .text
+            .contains("Need 2-3 manually read pages"));
+
+        // Simulate 3 manual page reads
+        let now = Instant::now();
+        state.auto_reading.calibration.on_page_entered(300, now);
+        state
+            .auto_reading
+            .calibration
+            .on_manual_page_turn(now + std::time::Duration::from_secs(60)); // 300 CPM
+
+        let now2 = now + std::time::Duration::from_secs(60);
+        state.auto_reading.calibration.on_page_entered(400, now2);
+        state
+            .auto_reading
+            .calibration
+            .on_manual_page_turn(now2 + std::time::Duration::from_secs(60)); // 400 CPM
+
+        let now3 = now2 + std::time::Duration::from_secs(60);
+        state.auto_reading.calibration.on_page_entered(350, now3);
+        state
+            .auto_reading
+            .calibration
+            .on_manual_page_turn(now3 + std::time::Duration::from_secs(60)); // 350 CPM
+
+        // Now calibrate: median is 350, 90% is 315 CPM!
+        let effects = state.update(ReaderAction::CalibrateReadingSpeed);
+        assert_eq!(effects, vec![ReaderEffect::SaveConfig]);
+        assert_eq!(state.auto_reading.cpm, 315);
+        assert_eq!(state.config.auto_reading_cpm(), 315);
+        assert!(state
+            .notification
+            .as_ref()
+            .unwrap()
+            .text
+            .contains("315 CPM"));
+    }
+
+    #[test]
+    fn discreet_auto_reading_commands() {
+        let mut state = state();
+        state.update(ReaderAction::ToggleDiscreet);
+        assert!(state.config.discreet_mode);
+
+        // Command: :auto 320
+        state.update(ReaderAction::OpenCommand);
+        for ch in "auto 320".chars() {
+            state.update(ReaderAction::Input(ch));
+        }
+        state.update(ReaderAction::Confirm);
+        assert!(state.auto_reading.active);
+        assert_eq!(state.auto_reading.cpm, 320);
+        assert_eq!(
+            state.agent.receipt.as_deref(),
+            Some("Stream pace: 320 CPM (Page)")
+        );
+
+        // Command: :cpm (query)
+        state.update(ReaderAction::OpenCommand);
+        for ch in "cpm".chars() {
+            state.update(ReaderAction::Input(ch));
+        }
+        state.update(ReaderAction::Confirm);
+        assert_eq!(
+            state.agent.receipt.as_deref(),
+            Some("Current stream pace: 320 CPM (Page)")
+        );
+
+        // Command: :pause
+        state.update(ReaderAction::OpenCommand);
+        for ch in "pause".chars() {
+            state.update(ReaderAction::Input(ch));
+        }
+        state.update(ReaderAction::Confirm);
+        assert!(state.auto_reading.paused);
+        assert_eq!(
+            state.agent.receipt.as_deref(),
+            Some("Stream pace: paused (320 CPM)")
+        );
+
+        // Command: :resume
+        state.update(ReaderAction::OpenCommand);
+        for ch in "resume".chars() {
+            state.update(ReaderAction::Input(ch));
+        }
+        state.update(ReaderAction::Confirm);
+        assert!(!state.auto_reading.paused);
+        assert_eq!(state.agent.receipt.as_deref(), Some("Stream pace: 320 CPM"));
+
+        // Command: :auto off
+        state.update(ReaderAction::OpenCommand);
+        for ch in "auto off".chars() {
+            state.update(ReaderAction::Input(ch));
+        }
+        state.update(ReaderAction::Confirm);
+        assert!(!state.auto_reading.active);
+        assert_eq!(state.agent.receipt.as_deref(), Some("Stream pace: off"));
     }
 }

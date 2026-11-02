@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
@@ -169,23 +171,64 @@ fn reading_footer_line(state: &ReaderState, palette: Palette) -> Line<'static> {
     let section_count = state.document.sections.len();
     let section_info = format!("{}/{}", section_idx + 1, section_count.max(1));
 
+    let auto_status = if state.auto_reading.active {
+        let now = Instant::now();
+        if state.auto_reading.paused {
+            format!("[Auto: Paused · {} CPM] ", state.auto_reading.cpm)
+        } else {
+            let rem_secs = state.auto_reading.remaining_time(now).as_secs();
+            match state.auto_reading.mode {
+                crate::auto_reading::AutoReadingMode::TimedPage => {
+                    format!("[Auto: {} CPM · {}s] ", state.auto_reading.cpm, rem_secs)
+                }
+                crate::auto_reading::AutoReadingMode::LineScroll => {
+                    format!("[Auto: {} CPM · Scroll] ", state.auto_reading.cpm)
+                }
+            }
+        }
+    } else {
+        String::new()
+    };
+
     if width < 54 {
-        return Line::from(vec![
+        let mut spans = vec![
             Span::styled(format!(" {percent_str} "), palette.accent()),
             Span::styled("· ", palette.muted()),
             Span::styled(format!("Sec {section_info}"), palette.body()),
-            Span::styled("  [?]", palette.muted()),
-        ]);
+        ];
+        if state.auto_reading.active {
+            let cpm = state.auto_reading.cpm;
+            let tag = if width < 42 {
+                if state.auto_reading.paused {
+                    format!(" [P:{cpm}]")
+                } else {
+                    format!(" [A:{cpm}]")
+                }
+            } else if state.auto_reading.paused {
+                format!(" [P: {cpm} CPM]")
+            } else {
+                format!(" [A: {cpm} CPM]")
+            };
+            spans.push(Span::styled(tag, palette.accent()));
+        } else {
+            spans.push(Span::styled("  [?]", palette.muted()));
+        }
+        return Line::from(spans);
     }
 
     let left_spans = vec![Span::styled(format!(" {percent_str} "), palette.accent())];
-    let right_spans = vec![
-        Span::styled(format!("Section {section_info}   "), palette.body()),
-        Span::styled("[? help] ", palette.muted()),
-    ];
+    let mut right_spans = Vec::new();
+    if !auto_status.is_empty() {
+        right_spans.push(Span::styled(auto_status.clone(), palette.accent()));
+    }
+    right_spans.push(Span::styled(
+        format!("Section {section_info}   "),
+        palette.body(),
+    ));
+    right_spans.push(Span::styled("[? help] ", palette.muted()));
 
     let left_width = percent_str.width() + 2;
-    let right_width = section_info.width() + 19;
+    let right_width = section_info.width() + 19 + auto_status.width();
     let available_bar = width.saturating_sub(left_width + right_width + 4);
 
     if available_bar >= 8 {
@@ -490,6 +533,7 @@ fn draw_search(
 
 fn render_reading_lines(state: &ReaderState, palette: Palette) -> Vec<Line<'static>> {
     let page = &state.pages[state.current_page];
+    let offset = state.line_scroll_offset.min(page.lines.len());
     let overlap_count = page.overlap_lines;
     let relevant_matches: Vec<(usize, usize, usize)> = if state.search_results.is_empty() {
         Vec::new()
@@ -510,10 +554,11 @@ fn render_reading_lines(state: &ReaderState, palette: Palette) -> Vec<Line<'stat
     };
 
     if relevant_matches.is_empty() {
-        return page
+        let mut lines: Vec<Line<'static>> = page
             .lines
             .iter()
             .enumerate()
+            .skip(offset)
             .map(|(idx, line)| {
                 let style = if idx < overlap_count {
                     palette.muted()
@@ -523,10 +568,18 @@ fn render_reading_lines(state: &ReaderState, palette: Palette) -> Vec<Line<'stat
                 Line::from(Span::styled(line.clone(), style))
             })
             .collect();
+        if offset > 0 && state.current_page + 1 < state.pages.len() {
+            let next_page = &state.pages[state.current_page + 1];
+            let remaining_slots = page.lines.len().saturating_sub(lines.len());
+            for line in next_page.lines.iter().take(remaining_slots) {
+                lines.push(Line::from(Span::styled(line.clone(), palette.body())));
+            }
+        }
+        return lines;
     }
 
     let mut rendered_lines = Vec::with_capacity(page.anchored_lines.len());
-    for (line_idx, line) in page.anchored_lines.iter().enumerate() {
+    for (line_idx, line) in page.anchored_lines.iter().enumerate().skip(offset) {
         if line.text.is_empty() {
             rendered_lines.push(Line::from(""));
             continue;
@@ -944,15 +997,21 @@ fn generate_agent_header_lines(
 
     let inspect_line = Line::from(vec![
         Span::styled(format!("{} ", agent_symbol("❯", ">")), palette.accent()),
-        Span::styled("inspect context", palette.body()),
+        Span::styled(
+            "optimize stream ingestion and telemetry buffer pipeline",
+            palette.body(),
+        ),
     ]);
     let tool_call_line = Line::from(vec![
         Span::styled(format!("{} ", agent_symbol("●", "*")), palette.accent()),
-        Span::styled("Read(local chunk)", palette.body()),
+        Span::styled(
+            format!(r#"inspect_buffer(channel="stream_ingress", offset={start}, limit={end})"#),
+            palette.body(),
+        ),
     ]);
     let tool_res_line = Line::from(vec![Span::styled(
         format!(
-            "  {} Loaded source range {start}–{end}",
+            "  {} Ingress buffer synchronized · {start}–{end} tokens verified",
             agent_symbol("⎿", "\\")
         ),
         palette.muted(),
@@ -962,7 +1021,7 @@ fn generate_agent_header_lines(
         return vec![Line::from(vec![
             Span::styled(format!("{spinner} "), palette.accent()),
             Span::styled(
-                format!("Reviewing AST · Read(local chunk) · range {start}–{end}"),
+                format!("Analyzing pipeline AST · stream_ingress [{start}..{end}] · active"),
                 palette.body(),
             ),
         ])];
@@ -973,7 +1032,7 @@ fn generate_agent_header_lines(
                 Span::styled(format!("{spinner} "), palette.accent()),
                 Span::styled(
                     format!(
-                        "Running code review analyzer... reading AST section {current_section}"
+                        "Running syntax tree analyzer... checking module section {current_section}"
                     ),
                     palette.accent(),
                 ),
@@ -981,7 +1040,9 @@ fn generate_agent_header_lines(
             Line::from(vec![
                 Span::styled(format!("{} ", agent_symbol("●", "*")), palette.accent()),
                 Span::styled(
-                    format!("Read(local chunk) · range {start}–{end} · Loaded source range"),
+                    format!(
+                        r#"inspect_buffer(channel="stream_ingress", offset={start}, limit={end}) · ready"#
+                    ),
                     palette.body(),
                 ),
             ]),
@@ -992,7 +1053,7 @@ fn generate_agent_header_lines(
             Line::from(vec![
                 Span::styled(format!("{spinner} "), palette.accent()),
                 Span::styled(
-                    format!("Running code review analyzer... reading section {current_section}"),
+                    format!("Running syntax tree analyzer... analyzing section {current_section}"),
                     palette.accent(),
                 ),
             ]),
@@ -1001,12 +1062,8 @@ fn generate_agent_header_lines(
         ];
     }
 
-    let format_label = match state.document.format {
-        crate::book::BookFormat::Epub => "EPUB",
-        crate::book::BookFormat::Pdf => "PDF",
-        crate::book::BookFormat::Txt => "TXT",
-        crate::book::BookFormat::Mobi => "MOBI",
-    };
+    let workspace = state.config.agent_workspace();
+    let target_file = state.config.agent_target();
     let density_label = match state.agent.density {
         AgentDensity::Comfortable => "comfortable",
         AgentDensity::Inspect => "inspect",
@@ -1017,7 +1074,7 @@ fn generate_agent_header_lines(
         Line::from(vec![
             Span::styled(format!("{spinner} "), palette.accent()),
             Span::styled(
-                format!("Running code review analyzer... reading AST for section {current_section}/{section_count}"),
+                format!("Running syntax tree analyzer... checking AST for module {current_section}/{section_count}"),
                 palette.accent(),
             ),
         ]),
@@ -1030,12 +1087,15 @@ fn generate_agent_header_lines(
             Span::styled(format!("{} ", agent_symbol("●", "*")), palette.accent()),
             Span::styled("Context initialized", palette.body()),
         ]),
-        Line::styled("  workspace: Reader-cli · session: local · mode: audit", palette.muted()),
+        Line::styled(
+            format!("  workspace: {workspace} · session: local · target: {target_file}"),
+            palette.muted(),
+        ),
         tool_call_line,
         tool_res_line,
         Line::styled(
             format!(
-                "  {} Target: {format_label} · Sections: {section_count} · Encoding: UTF-8",
+                "  {} Runtime: async-tokio · Modules: {section_count} · Encoding: UTF-8",
                 agent_symbol("⎿", "\\")
             ),
             palette.muted(),
@@ -1050,42 +1110,42 @@ fn generate_agent_header_lines(
         Line::styled("  ✓ Unicode Standard Annex #14 line-breaking engine active (Unicode 15.0.0)", palette.muted()),
         Line::from(vec![
             Span::styled(format!("  {} ", agent_symbol("●", "*")), palette.accent()),
-            Span::styled(r#"read_file path="src/discreet.rs" offset=1 limit=12"#, palette.body()),
+            Span::styled(r#"parse_syntax_tree(scope="pipeline::stream", depth=3)"#, palette.body()),
         ]),
-        Line::styled(format!("    {} Checked layout bounds & zero-leakage frame isolation [OK]", agent_symbol("⎿", "\\")), palette.muted()),
+        Line::styled(format!("    {} AST index warm · 142 syntax nodes active [OK]", agent_symbol("⎿", "\\")), palette.muted()),
         Line::from(vec![
             Span::styled(format!("  {} ", agent_symbol("●", "*")), palette.accent()),
-            Span::styled(r#"read_file path="src/reader_view.rs" offset=825 limit=16"#, palette.body()),
+            Span::styled(r#"check_type_signatures(interface="StreamProcessor", strict=true)"#, palette.body()),
         ]),
-        Line::styled(format!("    {} Validated terminal view renderer & palette inheritance [OK]", agent_symbol("⎿", "\\")), palette.muted()),
+        Line::styled(format!("    {} Type signatures matched · trait bounds satisfied [OK]", agent_symbol("⎿", "\\")), palette.muted()),
         Line::from(vec![
             Span::styled(format!("  {} ", agent_symbol("●", "*")), palette.accent()),
-            Span::styled(r#"read_file path="src/pagination.rs" offset=40 limit=10"#, palette.body()),
+            Span::styled(r#"verify_async_runtime(runtime="tokio", worker_threads=8)"#, palette.body()),
         ]),
-        Line::styled(format!("    {} Verified stable TextPosition character anchors across reflow [OK]", agent_symbol("⎿", "\\")), palette.muted()),
-        Line::styled("  Memory: AST cache warm · 18,420 syntax nodes indexed", palette.muted()),
-        Line::styled("  Worker: background disk persistence channel idle (0 queued)", palette.muted()),
-        Line::styled("  Snapshot: journal transaction committed · durable barrier synced", palette.muted()),
+        Line::styled(format!("    {} Task queue healthy · channel buffer occupancy: 4.2% [OK]", agent_symbol("⎿", "\\")), palette.muted()),
+        Line::styled("  Memory: heap cache warm · 18,420 allocations indexed", palette.muted()),
+        Line::styled("  Worker: async persistence channel idle (0 queued)", palette.muted()),
+        Line::styled("  Snapshot: transaction committed · durable barrier synced", palette.muted()),
         Line::from(vec![
             Span::styled(format!("  {} ", agent_symbol("●", "*")), palette.accent()),
-            Span::styled(r#"read_file path="src/book.rs" offset=1 limit=20"#, palette.body()),
+            Span::styled(r#"validate_schema_proto(package="telemetry.v1", syntax="proto3")"#, palette.body()),
         ]),
-        Line::styled(format!("    {} Checked format decoders (EPUB/PDF/TXT/MOBI) [OK]", agent_symbol("⎿", "\\")), palette.muted()),
+        Line::styled(format!("    {} Protobuf message definitions verified · wire format valid [OK]", agent_symbol("⎿", "\\")), palette.muted()),
         Line::from(vec![
             Span::styled(format!("  {} ", agent_symbol("●", "*")), palette.accent()),
-            Span::styled(r#"read_file path="src/storage.rs" offset=100 limit=15"#, palette.body()),
+            Span::styled(r#"inspect_connection_pool(backend="postgres", pool_size=16)"#, palette.body()),
         ]),
-        Line::styled(format!("    {} Verified SHA-256 deduplication and sidecar journal sync [OK]", agent_symbol("⎿", "\\")), palette.muted()),
+        Line::styled(format!("    {} Connection pool warm · query health check ping: 0.3ms [OK]", agent_symbol("⎿", "\\")), palette.muted()),
         Line::from(vec![
             Span::styled(format!("  {} ", agent_symbol("●", "*")), palette.accent()),
-            Span::styled(r#"read_file path="src/tui.rs" offset=50 limit=16"#, palette.body()),
+            Span::styled(r#"profile_memory_pool(allocator="mimalloc", max_heap="512MB")"#, palette.body()),
         ]),
-        Line::styled(format!("    {} Verified ConPTY event loop and alternate screen guards [OK]", agent_symbol("⎿", "\\")), palette.muted()),
+        Line::styled(format!("    {} Active heap: 34.6 MB · zero fragmentation detected [OK]", agent_symbol("⎿", "\\")), palette.muted()),
         Line::from(vec![
             Span::styled(format!("  {} ", agent_symbol("●", "*")), palette.accent()),
-            Span::styled(r#"read_file path="src/shelf.rs" offset=30 limit=14"#, palette.body()),
+            Span::styled(r#"run_bench_probe(target="batch_ingest", iterations=1000)"#, palette.body()),
         ]),
-        Line::styled(format!("    {} Reconciled bookshelf store, sidecars, and OPDS feeds [OK]", agent_symbol("⎿", "\\")), palette.muted()),
+        Line::styled(format!("    {} Ingestion throughput: 284,000 events/sec [OK]", agent_symbol("⎿", "\\")), palette.muted()),
     ];
 
     if target_height <= pool.len() {
@@ -1098,14 +1158,17 @@ fn generate_agent_header_lines(
             lines.push(Line::from(vec![
                 Span::styled(format!("  {} ", agent_symbol("●", "*")), palette.accent()),
                 Span::styled(
-                    format!(r#"read_chunk index={idx} status=synced hash=verified"#),
+                    format!(
+                        r#"sync_buffer_block(block_id={idx}, status="verified", hash="0x{:x}")"#,
+                        0x8f2a_usize.wrapping_add(idx * 0x37)
+                    ),
                     palette.muted(),
                 ),
             ]));
             if lines.len() < target_height {
                 lines.push(Line::styled(
                     format!(
-                        "    {} Verified AST node consistency for block #{idx} [OK]",
+                        "    {} Verified pipeline node consistency for block #{idx} [OK]",
                         agent_symbol("⎿", "\\")
                     ),
                     palette.muted(),
@@ -1141,7 +1204,7 @@ fn draw_discreet(frame: &mut ratatui::Frame<'_>, state: &ReaderState, palette: P
             split_row_line(
                 vec![
                     Span::styled("workspace: ", palette.muted()),
-                    Span::styled("Reader-cli", palette.body()),
+                    Span::styled(state.config.agent_workspace().to_string(), palette.body()),
                 ],
                 vec![
                     Span::styled("session: ", palette.muted()),
@@ -1151,12 +1214,12 @@ fn draw_discreet(frame: &mut ratatui::Frame<'_>, state: &ReaderState, palette: P
             ),
             split_row_line(
                 vec![
-                    Span::styled("mode: ", palette.muted()),
-                    Span::styled("Agent Terminal Reading", palette.body()),
+                    Span::styled("task: ", palette.muted()),
+                    Span::styled(state.config.agent_task().to_string(), palette.body()),
                 ],
                 vec![
-                    Span::styled("file: ", palette.muted()),
-                    Span::styled("context.txt", palette.body()),
+                    Span::styled("target: ", palette.muted()),
+                    Span::styled(state.config.agent_target().to_string(), palette.body()),
                 ],
                 width,
             ),
@@ -1168,125 +1231,25 @@ fn draw_discreet(frame: &mut ratatui::Frame<'_>, state: &ReaderState, palette: P
         frame.render_widget(Paragraph::new(banner_lines), layout.banner);
     }
 
-    // 2. Session Context & Tool Activity (header)
-    let header_lines = if state.hidden {
-        let inspect_line = Line::from(vec![
-            Span::styled(format!("{} ", agent_symbol("❯", ">")), palette.accent()),
-            Span::styled("cargo test --workspace --lib", palette.body()),
-        ]);
-        let tool_call_line = Line::from(vec![
-            Span::styled(format!("{} ", agent_symbol("●", "*")), palette.accent()),
-            Span::styled(
-                r#"run_command(command="cargo test --workspace --lib")"#,
-                palette.body(),
-            ),
-        ]);
-        let tool_res_line = Line::styled(
-            format!(
-                "  {} Executing runner in isolated process · Output folded [38 passed]",
-                agent_symbol("⎿", "\\")
-            ),
-            palette.muted(),
-        );
-        if layout.mode == AgentViewMode::Full {
-            vec![inspect_line, tool_call_line, tool_res_line]
-        } else {
-            match layout.header.height {
-                1 => vec![tool_call_line],
-                _ => vec![tool_call_line, tool_res_line],
-            }
-        }
-    } else {
-        generate_agent_header_lines(
-            usize::from(layout.header.height),
-            state,
-            palette,
-            start,
-            end,
-        )
-    };
-    frame.render_widget(Paragraph::new(header_lines), layout.header);
-
-    // 3. Assistant Response (body)
     if state.hidden {
-        let tool_lines = simulated_tool_lines(usize::from(layout.body.height), palette);
-        frame.render_widget(Paragraph::new(tool_lines), layout.body);
-    } else {
-        let mut body_lines = Vec::new();
-        if state.agent.help {
-            let mut help_entries = vec![
-                Line::from("Local commands · j/k scroll · Esc close"),
-                Line::from(""),
-            ];
-            help_entries.extend(
-                DISCREET_BINDINGS
-                    .iter()
-                    .map(|b| Line::from(format!("  {:<12} {}", b.keys, b.label))),
-            );
-            help_entries.push(Line::from(""));
-            help_entries.push(Line::from("Executable local commands:"));
-            help_entries.extend(
-                LOCAL_COMMANDS
-                    .iter()
-                    .map(|(name, _)| Line::from(format!("  :{:<11} execute command", name))),
-            );
-            let visible_help = help_entries
-                .into_iter()
-                .skip(state.agent.help_offset)
-                .take(usize::from(net_height));
-            for line in visible_help {
-                body_lines.push(Line::from(vec![
-                    Span::styled("  ", palette.muted()),
-                    Span::styled(line.to_string(), palette.body()),
-                ]));
-            }
-        } else {
-            body_lines.push(Line::from(vec![
-                Span::styled(format!("{} ", agent_symbol("●", "*")), palette.accent()),
-                Span::styled("Assistant", palette.body()),
-            ]));
+        let middle_height = frame
+            .area()
+            .height
+            .saturating_sub(layout.banner.height + layout.footer.height);
+        let middle_area = Rect::new(
+            frame.area().x,
+            layout.banner.bottom(),
+            frame.area().width,
+            middle_height,
+        );
+        let tool_lines = simulated_tool_lines(usize::from(middle_area.height), palette);
+        frame.render_widget(Paragraph::new(tool_lines), middle_area);
 
-            let visible_lines = state.agent.view.visible(net_height);
-            for (i, vline) in visible_lines.iter().enumerate() {
-                let line_num = start + i;
-                let is_overlap = i < state.agent.view.context_rows;
-                let text_style = if is_overlap {
-                    palette.muted()
-                } else {
-                    palette.body()
-                };
-                let raw_text = &vline.line.text;
-                match state.agent.density {
-                    AgentDensity::Comfortable => {
-                        body_lines
-                            .push(Line::from(vec![Span::styled(raw_text.clone(), text_style)]));
-                    }
-                    AgentDensity::Inspect => {
-                        body_lines.push(Line::from(vec![
-                            Span::styled(format!("{:>4} │ ", line_num), palette.muted()),
-                            Span::styled(raw_text.clone(), text_style),
-                        ]));
-                    }
-                }
-            }
-
-            if layout.body.height > net_height + 1 {
-                body_lines.push(Line::from(vec![Span::styled(
-                    "  [Output complete]",
-                    palette.muted(),
-                )]));
-            }
-        }
-        frame.render_widget(Paragraph::new(body_lines), layout.body);
-    }
-
-    // 4. Activity & Actions (footer)
-    let footer_lines = if state.hidden {
         let prompt_spans = vec![
             Span::styled(format!("{} ", agent_symbol("❯", ">")), palette.muted()),
             Span::styled("continue_", palette.muted()),
         ];
-        if layout.mode == AgentViewMode::Full && layout.footer.height >= 3 {
+        let footer_lines = if layout.mode == AgentViewMode::Full && layout.footer.height >= 3 {
             vec![
                 Line::styled(
                     agent_symbol("─", "-").repeat(usize::from(width)),
@@ -1318,78 +1281,190 @@ fn draw_discreet(frame: &mut ratatui::Frame<'_>, state: &ReaderState, palette: P
                     ),
                 ],
             }
+        };
+        frame.render_widget(Paragraph::new(footer_lines), layout.footer);
+        return;
+    }
+
+    // 2. Session Context & Tool Activity (header)
+    let header_lines = generate_agent_header_lines(
+        usize::from(layout.header.height),
+        state,
+        palette,
+        start,
+        end,
+    );
+    frame.render_widget(Paragraph::new(header_lines), layout.header);
+
+    // 3. Assistant Response (body)
+    let mut body_lines = Vec::new();
+    if state.agent.help {
+        let mut help_entries = vec![
+            Line::from("Local commands · j/k scroll · Esc close"),
+            Line::from(""),
+        ];
+        help_entries.extend(
+            DISCREET_BINDINGS
+                .iter()
+                .map(|b| Line::from(format!("  {:<12} {}", b.keys, b.label))),
+        );
+        help_entries.push(Line::from(""));
+        help_entries.push(Line::from("Executable local commands:"));
+        help_entries.extend(
+            LOCAL_COMMANDS
+                .iter()
+                .map(|(name, _)| Line::from(format!("  :{:<11} execute command", name))),
+        );
+        let visible_help = help_entries
+            .into_iter()
+            .skip(state.agent.help_offset)
+            .take(usize::from(net_height));
+        for line in visible_help {
+            body_lines.push(Line::from(vec![
+                Span::styled("  ", palette.muted()),
+                Span::styled(line.to_string(), palette.body()),
+            ]));
         }
     } else {
-        let current_chunk = (start / net_height as usize).saturating_add(1);
-        let total_chunks = (total / net_height as usize).max(1);
-        let chunk_label = format!("chunk {current_chunk}/{total_chunks}");
+        body_lines.push(Line::from(vec![
+            Span::styled(format!("{} ", agent_symbol("●", "*")), palette.accent()),
+            Span::styled("Assistant", palette.body()),
+        ]));
 
-        let status_hint = match state.agent.receipt {
-            Some(receipt) => format!("✓ {receipt}"),
-            None if state.agent.command.is_some() => {
-                "Enter execute · Esc cancel · Tab complete".to_string()
+        let visible_lines = state.agent.view.visible(net_height);
+        for (i, vline) in visible_lines.iter().enumerate() {
+            let line_num = start + i;
+            let is_overlap = i < state.agent.view.context_rows;
+            let text_style = if is_overlap {
+                palette.muted()
+            } else {
+                palette.body()
+            };
+            let raw_text = &vline.line.text;
+            match state.agent.density {
+                AgentDensity::Comfortable => {
+                    body_lines.push(Line::from(vec![Span::styled(raw_text.clone(), text_style)]));
+                }
+                AgentDensity::Inspect => {
+                    body_lines.push(Line::from(vec![
+                        Span::styled(format!("{:>4} │ ", line_num), palette.muted()),
+                        Span::styled(raw_text.clone(), text_style),
+                    ]));
+                }
             }
-            None if state.agent.help => "j/k scroll · Esc close".to_string(),
-            None => "j/k scroll · : cmd · / find · F12 fold".to_string(),
-        };
+        }
 
-        let prompt_spans = match &state.agent.command {
-            Some(text) => vec![
-                Span::styled(format!("{} :", agent_symbol("❯", ">")), palette.accent()),
-                Span::styled(text.clone(), palette.body()),
-                Span::styled("█", palette.accent()),
-            ],
-            None => vec![
-                Span::styled(format!("{} ", agent_symbol("❯", ">")), palette.muted()),
-                Span::styled("continue_", palette.muted()),
-            ],
-        };
+        if layout.body.height > net_height + 1 {
+            body_lines.push(Line::from(vec![Span::styled(
+                "  [Stream buffer synchronized · 0 warnings · ready]",
+                palette.muted(),
+            )]));
+        }
+    }
+    frame.render_widget(Paragraph::new(body_lines), layout.body);
 
-        if layout.mode == AgentViewMode::Full && layout.footer.height >= 3 {
-            vec![
-                Line::styled(
-                    agent_symbol("─", "-").repeat(usize::from(width)),
-                    palette.muted(),
-                ),
-                split_row_line(
-                    vec![
-                        Span::styled("activity: ", palette.muted()),
-                        Span::styled("init ✓   read ✓   render ✓", palette.accent()),
-                    ],
-                    vec![Span::styled(chunk_label, palette.muted())],
-                    width,
-                ),
-                split_row_line(
-                    prompt_spans,
-                    vec![Span::styled(status_hint, palette.muted())],
-                    width,
-                ),
-            ]
+    // 4. Activity & Actions (footer)
+    let current_chunk = (start / net_height as usize).saturating_add(1);
+    let total_chunks = (total / net_height as usize).max(1);
+    let pct = (start * 100 / total.max(1)).min(100);
+    let chunk_label = if state.auto_reading.active {
+        let now = Instant::now();
+        let cpm = state.auto_reading.cpm;
+        if state.auto_reading.paused {
+            format!("batch {current_chunk}/{total_chunks} ({pct}%) · stream: {cpm} cpm [paused]")
         } else {
-            match layout.footer.height {
-                0 => Vec::new(),
-                1 => vec![Line::from(prompt_spans)],
-                _ => vec![
-                    Line::from(prompt_spans),
-                    Line::styled(format!("  {status_hint}"), palette.muted()),
-                ],
+            let rem_secs = state.auto_reading.remaining_time(now).as_secs();
+            match state.auto_reading.mode {
+                crate::auto_reading::AutoReadingMode::TimedPage => {
+                    format!("batch {current_chunk}/{total_chunks} ({pct}%) · stream: {cpm} cpm ({rem_secs}s)")
+                }
+                crate::auto_reading::AutoReadingMode::LineScroll => {
+                    format!("batch {current_chunk}/{total_chunks} ({pct}%) · stream: {cpm} cpm [scroll]")
+                }
             }
+        }
+    } else {
+        format!("batch {current_chunk}/{total_chunks} ({pct}%)")
+    };
+
+    let status_hint = match state.agent.receipt.as_deref() {
+        Some(receipt) => format!("✓ {receipt}"),
+        None if state.agent.command.is_some() => {
+            "Enter execute · Esc cancel · Tab complete".to_string()
+        }
+        None if state.agent.help => "j/k scroll · Esc close".to_string(),
+        None if state.auto_reading.active => {
+            let cpm = state.auto_reading.cpm;
+            if state.auto_reading.paused {
+                format!("stream: {cpm} cpm [paused] · :help")
+            } else {
+                let rem_secs = state.auto_reading.remaining_time(Instant::now()).as_secs();
+                match state.auto_reading.mode {
+                    crate::auto_reading::AutoReadingMode::TimedPage => {
+                        format!("stream: {cpm} cpm ({rem_secs}s) · :help")
+                    }
+                    crate::auto_reading::AutoReadingMode::LineScroll => {
+                        format!("stream: {cpm} cpm [scroll] · :help")
+                    }
+                }
+            }
+        }
+        None => ":help · :density · :checkpoint · :fold".to_string(),
+    };
+
+    let prompt_spans = match &state.agent.command {
+        Some(text) => vec![
+            Span::styled(format!("{} :", agent_symbol("❯", ">")), palette.accent()),
+            Span::styled(text.clone(), palette.body()),
+            Span::styled("█", palette.accent()),
+        ],
+        None => vec![
+            Span::styled(format!("{} ", agent_symbol("❯", ">")), palette.muted()),
+            Span::styled("continue_", palette.muted()),
+        ],
+    };
+
+    let footer_lines = if layout.mode == AgentViewMode::Full && layout.footer.height >= 3 {
+        vec![
+            Line::styled(
+                agent_symbol("─", "-").repeat(usize::from(width)),
+                palette.muted(),
+            ),
+            split_row_line(
+                vec![
+                    Span::styled("activity: ", palette.muted()),
+                    Span::styled("parse ✓   validate ✓   sync ✓", palette.accent()),
+                ],
+                vec![Span::styled(chunk_label, palette.muted())],
+                width,
+            ),
+            split_row_line(
+                prompt_spans,
+                vec![Span::styled(status_hint, palette.muted())],
+                width,
+            ),
+        ]
+    } else {
+        match layout.footer.height {
+            0 => Vec::new(),
+            1 => vec![Line::from(prompt_spans)],
+            _ => vec![
+                Line::from(prompt_spans),
+                Line::styled(format!("  {status_hint}"), palette.muted()),
+            ],
         }
     };
     frame.render_widget(Paragraph::new(footer_lines), layout.footer);
 
-    if !state.hidden {
-        if let Some(text) = state.agent.command.as_ref() {
-            let prompt_row_offset =
-                if layout.mode == AgentViewMode::Full && layout.footer.height >= 3 {
-                    2
-                } else {
-                    0
-                };
-            let row = layout.footer.y + prompt_row_offset;
-            let col = (3 + text.width() as u16).min(layout.footer.width.saturating_sub(1));
-            frame.set_cursor_position((layout.footer.x + col, row));
-        }
+    if let Some(text) = state.agent.command.as_ref() {
+        let prompt_row_offset = if layout.mode == AgentViewMode::Full && layout.footer.height >= 3 {
+            2
+        } else {
+            0
+        };
+        let row = layout.footer.y + prompt_row_offset;
+        let col = (3 + text.width() as u16).min(layout.footer.width.saturating_sub(1));
+        frame.set_cursor_position((layout.footer.x + col, row));
     }
 }
 
@@ -1397,88 +1472,242 @@ fn simulated_tool_lines(target_height: usize, palette: Palette) -> Vec<Line<'sta
     if target_height == 0 {
         return Vec::new();
     }
-    let mut body_lines = Vec::new();
-    body_lines.push(Line::from(vec![
+
+    let inspect_line = Line::from(vec![
+        Span::styled(format!("{} ", agent_symbol("❯", ">")), palette.accent()),
+        Span::styled("cargo test --workspace --lib", palette.body()),
+    ]);
+    let tool_call_line = Line::from(vec![
         Span::styled(format!("{} ", agent_symbol("●", "*")), palette.accent()),
         Span::styled(
             r#"run_command command="cargo test --workspace --lib""#,
             palette.body(),
         ),
         Span::styled(" · Output folded", palette.muted()),
-    ]));
-    body_lines.push(Line::styled(
-        "   Compiling reader v0.1.0 (/workspace/reader-cli)",
+    ]);
+    let success_exit_line = Line::styled(
+        "  [Tool execution completed successfully · exit code 0]",
         palette.muted(),
-    ));
-    body_lines.push(Line::styled("   Checking ratatui v0.29.0", palette.muted()));
-    body_lines.push(Line::styled(
-        "   Checking crossterm v0.28.1",
-        palette.muted(),
-    ));
-    body_lines.push(Line::styled(
-        "    Finished `test` profile [unoptimized + debuginfo] in 0.85s",
-        palette.muted(),
-    ));
-    body_lines.push(Line::styled(
-        "     Running unittests src/lib.rs (target/debug/deps/reader-d1838cf4023)",
-        palette.muted(),
-    ));
-    body_lines.push(Line::from(""));
-    body_lines.push(Line::styled("running 38 tests", palette.body()));
+    );
 
-    let test_cases = [
-        "test book::tests::test_load_epub ... ok",
-        "test storage::tests::test_deduplication ... ok",
-        "test pagination::tests::test_stable_anchors ... ok",
-        "test tui::tests::test_event_handling ... ok",
-        "test reader_view::tests::test_layout_bounds ... ok",
-        "test reader_input::tests::test_keybindings ... ok",
-        "test paths::tests::test_portable_paths ... ok",
-        "test atomic_file::tests::test_atomic_write ... ok",
-        "test discreet::tests::test_zero_leakage ... ok",
-        "test shelf::tests::test_reconciliation ... ok",
-        "test network::tests::test_bounded_downloads ... ok",
-        "test journal::tests::test_snapshot_recovery ... ok",
-        "test parser::tests::test_utf8_decoding ... ok",
-        "test render::tests::test_line_breaking ... ok",
-        "test search::tests::test_exact_matches ... ok",
-        "test session::tests::test_reading_recency ... ok",
-        "test format::tests::test_mobi_metadata ... ok",
-        "test config::tests::test_persistence ... ok",
-        "test book::tests::test_metadata_sanitization ... ok",
-        "test shelf::tests::test_cache_invalidation ... ok",
-        "test tui::tests::test_differential_render ... ok",
-        "test discreet::tests::test_anchor_preservation ... ok",
-        "test render::tests::test_cjk_wrap_boundaries ... ok",
-        "test storage::tests::test_migration_integrity ... ok",
-        "test search::tests::test_case_folding ... ok",
-        "test network::tests::test_redirect_boundary ... ok",
-        "test pagination::tests::test_vertical_resize ... ok",
-        "test session::tests::test_reading_speed_calc ... ok",
+    if target_height == 1 {
+        return vec![tool_call_line];
+    }
+    if target_height == 2 {
+        return vec![inspect_line, tool_call_line];
+    }
+    if target_height == 3 {
+        return vec![inspect_line, tool_call_line, success_exit_line];
+    }
+
+    let compile_lines = [
+        Line::styled(
+            "   Compiling core-runtime v0.4.2 (/workspace/data-mesh-service)",
+            palette.muted(),
+        ),
+        Line::styled("   Checking tokio v1.38.0", palette.muted()),
+        Line::styled("   Checking prost v0.13.1", palette.muted()),
+        Line::styled(
+            "    Finished `test` profile [unoptimized + debuginfo] in 0.85s",
+            palette.muted(),
+        ),
+        Line::styled(
+            "     Running unittests src/lib.rs (target/debug/deps/core_runtime-d1838cf4023)",
+            palette.muted(),
+        ),
     ];
 
-    for tc in test_cases {
-        if body_lines.len() + 3 >= target_height {
-            break;
+    if target_height < 12 {
+        let mut lines = Vec::new();
+        lines.push(inspect_line);
+        lines.push(tool_call_line);
+        for cl in &compile_lines {
+            if lines.len() + 1 >= target_height {
+                break;
+            }
+            lines.push(cl.clone());
         }
-        body_lines.push(Line::styled(format!("  {tc}"), palette.muted()));
+        if lines.len() < target_height {
+            lines.push(success_exit_line);
+        }
+        lines.truncate(target_height);
+        return lines;
     }
 
-    if body_lines.len() + 2 <= target_height {
-        body_lines.push(Line::from(""));
-        body_lines.push(Line::styled(
+    let header_block = vec![
+        inspect_line,
+        tool_call_line,
+        compile_lines[0].clone(),
+        compile_lines[1].clone(),
+        compile_lines[2].clone(),
+        compile_lines[3].clone(),
+        compile_lines[4].clone(),
+        Line::from(""),
+        Line::styled("running 38 tests", palette.body()),
+    ];
+
+    let summary_block = vec![
+        Line::from(""),
+        Line::styled(
             "test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out",
             palette.accent(),
-        ));
+        ),
+        success_exit_line,
+    ];
+
+    let test_cases = [
+        "test pipeline::tests::test_stream_ingress ... ok",
+        "test storage::tests::test_partition_dedup ... ok",
+        "test buffer::tests::test_ring_buffer_capacity ... ok",
+        "test telemetry::tests::test_counter_metrics ... ok",
+        "test parser::tests::test_proto_wire_decode ... ok",
+        "test transport::tests::test_grpc_streaming ... ok",
+        "test config::tests::test_cluster_endpoints ... ok",
+        "test atomic_file::tests::test_durable_wal_sync ... ok",
+        "test cluster::tests::test_leader_election ... ok",
+        "test schema::tests::test_registry_evolution ... ok",
+        "test network::tests::test_backpressure_threshold ... ok",
+        "test journal::tests::test_wal_checkpoint_replay ... ok",
+        "test parser::tests::test_utf8_payload_validation ... ok",
+        "test transform::tests::test_windowed_aggregation ... ok",
+        "test query::tests::test_predicate_pushdown ... ok",
+        "test session::tests::test_client_heartbeat ... ok",
+        "test codec::tests::test_snappy_compression ... ok",
+        "test pool::tests::test_connection_eviction ... ok",
+        "test security::tests::test_token_signature_verify ... ok",
+        "test cache::tests::test_lru_invalidation ... ok",
+        "test scheduler::tests::test_priority_queue ... ok",
+        "test router::tests::test_load_balance_weighted ... ok",
+        "test transform::tests::test_cjk_token_boundaries ... ok",
+        "test storage::tests::test_snapshot_parity ... ok",
+        "test query::tests::test_index_scan_range ... ok",
+        "test network::tests::test_circuit_breaker_trip ... ok",
+        "test buffer::tests::test_overflow_spill_to_disk ... ok",
+        "test session::tests::test_throughput_watermark ... ok",
+        "test audit::tests::test_immutable_event_log ... ok",
+        "test config::tests::test_dynamic_reload ... ok",
+        "test codec::tests::test_varint_encoding ... ok",
+        "test journal::tests::test_segment_compaction ... ok",
+        "test parser::tests::test_delimiter_fuzzing ... ok",
+        "test transport::tests::test_tls_handshake_timeout ... ok",
+        "test router::tests::test_routing_table_diff ... ok",
+        "test cluster::tests::test_split_brain_recovery ... ok",
+        "test storage::tests::test_atomic_commit_log ... ok",
+        "test telemetry::tests::test_histogram_latency_percentiles ... ok",
+    ];
+
+    if target_height <= 50 {
+        let available_tests = target_height - 12;
+        let mut lines = header_block;
+        for tc in &test_cases[..available_tests] {
+            lines.push(Line::styled(format!("  {tc}"), palette.muted()));
+        }
+        lines.extend(summary_block);
+        return lines;
     }
-    if body_lines.len() < target_height {
-        body_lines.push(Line::styled(
-            "  [Tool execution completed successfully · exit code 0]",
+
+    let doctest_block = vec![
+        Line::from(""),
+        Line::styled("   Doc-tests core_runtime", palette.muted()),
+        Line::from(""),
+        Line::styled("running 0 tests", palette.body()),
+        Line::from(""),
+        Line::styled(
+            "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out",
+            palette.accent(),
+        ),
+    ];
+
+    if target_height <= 56 {
+        let available_doctests = target_height - 50;
+        let mut lines = header_block;
+        for tc in &test_cases {
+            lines.push(Line::styled(format!("  {tc}"), palette.muted()));
+        }
+        lines.extend(summary_block);
+        lines.extend(doctest_block.into_iter().take(available_doctests));
+        return lines;
+    }
+
+    // target_height > 56: prepend authentic prior session history
+    let extra_needed = target_height - 56;
+    let prior_history = [
+        Line::from(vec![
+            Span::styled(format!("{} ", agent_symbol("❯", ">")), palette.accent()),
+            Span::styled("git status --short", palette.body()),
+        ]),
+        Line::styled(" M crates/core/src/pipeline.rs", palette.muted()),
+        Line::styled(" M Cargo.lock", palette.muted()),
+        Line::styled("?? target/", palette.muted()),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(format!("{} ", agent_symbol("❯", ">")), palette.accent()),
+            Span::styled(
+                "cargo clippy --workspace --all-targets -- -D warnings",
+                palette.body(),
+            ),
+        ]),
+        Line::styled(
+            "   Compiling core-runtime v0.4.2 (/workspace/data-mesh-service)",
             palette.muted(),
-        ));
+        ),
+        Line::styled("    Checking tokio v1.38.0", palette.muted()),
+        Line::styled(
+            "    Finished `dev` profile [unoptimized + debuginfo] in 0.58s",
+            palette.muted(),
+        ),
+        Line::styled(
+            "  [Clippy check completed successfully · exit code 0]",
+            palette.muted(),
+        ),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(format!("{} ", agent_symbol("❯", ">")), palette.accent()),
+            Span::styled("cargo check --tests", palette.body()),
+        ]),
+        Line::styled(
+            "    Checking core-runtime v0.4.2 (/workspace/data-mesh-service)",
+            palette.muted(),
+        ),
+        Line::styled(
+            "    Finished `test` profile [unoptimized + debuginfo] in 0.42s",
+            palette.muted(),
+        ),
+        Line::styled(
+            "  [Cargo check passed · 0 warnings · 0 errors]",
+            palette.muted(),
+        ),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(format!("{} ", agent_symbol("❯", ">")), palette.accent()),
+            Span::styled("rustc --version", palette.body()),
+        ]),
+        Line::styled("rustc 1.82.0 (f6e511eec 2024-10-15)", palette.muted()),
+        Line::from(""),
+    ];
+
+    let mut full_test_run = header_block;
+    for tc in &test_cases {
+        full_test_run.push(Line::styled(format!("  {tc}"), palette.muted()));
     }
-    body_lines.truncate(target_height);
-    body_lines
+    full_test_run.extend(summary_block);
+    full_test_run.extend(doctest_block);
+
+    let mut prefix = Vec::new();
+    while prefix.len() < extra_needed {
+        let remaining = extra_needed - prefix.len();
+        if remaining >= prior_history.len() {
+            prefix.extend(prior_history.iter().cloned());
+        } else {
+            prefix.extend(
+                prior_history[prior_history.len() - remaining..]
+                    .iter()
+                    .cloned(),
+            );
+        }
+    }
+    prefix.extend(full_test_run);
+    prefix
 }
 
 fn truncate_width(text: &str, width: usize) -> String {
@@ -1694,9 +1923,9 @@ mod tests {
         terminal.draw(|f| draw(f, &s)).unwrap();
         let screen = format!("{}", terminal.backend());
         for expected in [
-            "Read(local chunk)",
+            "inspect_buffer",
             "Assistant",
-            "Loaded source range",
+            "Ingress buffer synchronized",
             "bright readable text",
             "continue_",
         ] {
@@ -1709,6 +1938,8 @@ mod tests {
             "WARN",
             "Book information",
             "book.txt",
+            "Reader-cli",
+            "read_chunk",
         ] {
             assert!(!screen.contains(secret), "Leaked secret: {secret}");
         }
@@ -1741,23 +1972,23 @@ mod tests {
 
             if is_full {
                 // Top Banner & Scheme A context
-                assert!(screen.contains("workspace: Reader-cli"));
+                assert!(screen.contains("workspace: data-mesh-service"));
                 assert!(screen.contains("session: local"));
-                assert!(screen.contains("mode: Agent Terminal Reading"));
-                assert!(screen.contains("file: context.txt"));
+                assert!(screen.contains("task: Code Review & Refactor"));
+                assert!(screen.contains("target: crates/core/src/pipeline.rs"));
                 assert!(screen.contains("Context initialized"));
-                assert!(screen.contains("activity: init ✓   read ✓   render ✓"));
-                assert!(screen.contains("chunk "));
+                assert!(screen.contains("activity: parse ✓   validate ✓   sync ✓"));
+                assert!(screen.contains("batch "));
             }
 
             // Region 1 & 2: Session Context and Tool Activity
-            assert!(screen.contains("Read(local chunk)"));
-            assert!(screen.contains("Loaded source range"));
+            assert!(screen.contains("inspect_buffer"));
+            assert!(screen.contains("Ingress buffer synchronized"));
 
             // Region 3: Assistant Response with verbatim prose
             assert!(screen.contains("Assistant"));
             assert!(screen.contains("bright readable text"));
-            assert!(screen.contains("[Output complete]"));
+            assert!(screen.contains("[Stream buffer synchronized · 0 warnings · ready]"));
 
             // Region 4: Input / Action
             assert!(screen.contains("continue_"));
@@ -1777,15 +2008,14 @@ mod tests {
         let screen = format!("{}", terminal.backend());
 
         // Header has 25 lines full of realistic Agent trace steps
-        assert!(screen.contains("workspace: Reader-cli"));
-        assert!(screen.contains("inspect context"));
+        assert!(screen.contains("workspace: data-mesh-service"));
+        assert!(screen.contains("optimize stream ingestion and telemetry buffer pipeline"));
         assert!(screen.contains("cargo clippy --workspace --all-targets -- -D warnings"));
-        assert!(screen.contains(r#"read_file path="src/discreet.rs""#));
-        assert!(screen.contains(r#"read_file path="src/reader_view.rs""#));
-        assert!(screen.contains(r#"read_file path="src/pagination.rs""#));
-        assert!(screen.contains(r#"read_file path="src/book.rs""#));
-        assert!(screen.contains("Read(local chunk)"));
-        assert!(screen.contains("Loaded source range"));
+        assert!(screen.contains(r#"inspect_buffer(channel="stream_ingress""#));
+        assert!(screen.contains(r#"parse_syntax_tree(scope="pipeline::stream""#));
+        assert!(screen.contains(r#"check_type_signatures(interface="StreamProcessor""#));
+        assert!(screen.contains(r#"verify_async_runtime(runtime="tokio""#));
+        assert!(screen.contains("Ingress buffer synchronized"));
         assert!(screen.contains("Context updated · Waiting for continuation"));
 
         // High compact terminal (60x40) with custom agent lines = 18
@@ -1797,11 +2027,10 @@ mod tests {
         let mut terminal_compact = Terminal::new(TestBackend::new(60, 40)).unwrap();
         terminal_compact.draw(|f| draw(f, &s)).unwrap();
         let compact_screen = format!("{}", terminal_compact.backend());
-        assert!(compact_screen.contains("inspect context"));
-        assert!(compact_screen.contains(r#"read_file path="src/discreet.rs""#));
-        assert!(compact_screen.contains(r#"read_file path="src/reader_view.rs""#));
-        assert!(compact_screen.contains("Read(local chunk)"));
-        assert!(compact_screen.contains("Loaded source range"));
+        assert!(compact_screen.contains("optimize stream ingestion"));
+        assert!(compact_screen.contains(r#"inspect_buffer(channel="stream_ingress""#));
+        assert!(compact_screen.contains(r#"parse_syntax_tree"#));
+        assert!(compact_screen.contains("Ingress buffer synchronized"));
     }
 
     #[test]
@@ -1877,8 +2106,8 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal.draw(|f| draw(f, &s)).unwrap();
         let reading_screen = format!("{}", terminal.backend());
-        assert!(reading_screen.contains("workspace: Reader-cli"));
-        assert!(reading_screen.contains("Agent Terminal Reading"));
+        assert!(reading_screen.contains("workspace: data-mesh-service"));
+        assert!(reading_screen.contains("Code Review & Refactor"));
         assert!(reading_screen.contains("Assistant"));
 
         // Toggle hidden:
@@ -1886,8 +2115,8 @@ mod tests {
         terminal.draw(|f| draw(f, &s)).unwrap();
         let folded_screen = format!("{}", terminal.backend());
         // Outer banner remains identical
-        assert!(folded_screen.contains("workspace: Reader-cli"));
-        assert!(folded_screen.contains("Agent Terminal Reading"));
+        assert!(folded_screen.contains("workspace: data-mesh-service"));
+        assert!(folded_screen.contains("Code Review & Refactor"));
         // Body was subtly replaced with tool execution
         assert!(folded_screen.contains("run_command command="));
         assert!(folded_screen.contains("Output folded"));
@@ -1921,6 +2150,47 @@ mod tests {
     }
 
     #[test]
+    fn f12_in_tall_terminal_has_no_large_blank_gaps() {
+        let mut s = state();
+        s.resize(120, 60);
+        s.update(crate::reader_state::ReaderAction::ToggleDiscreet);
+        s.update(crate::reader_state::ReaderAction::ToggleHidden);
+        assert!(s.hidden);
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 60)).unwrap();
+        terminal.draw(|f| draw(f, &s)).unwrap();
+        let screen = format!("{}", terminal.backend());
+
+        assert!(screen.contains("workspace: data-mesh-service"));
+        assert!(screen.contains("cargo test --workspace --lib"));
+        assert!(screen.contains("running 38 tests"));
+        assert!(screen.contains("test result: ok. 38 passed"));
+        assert!(screen.contains("F12 resume"));
+
+        // Verify that there are no large gaps of blank lines in the middle area (rows 3..57).
+        let buffer = terminal.backend().buffer();
+        let mut max_consecutive_empty = 0;
+        let mut current_consecutive_empty = 0;
+        for y in 3..57 {
+            let row_empty = (0..120).all(|x| {
+                buffer
+                    .cell((x, y))
+                    .is_none_or(|c| c.symbol().trim().is_empty())
+            });
+            if row_empty {
+                current_consecutive_empty += 1;
+                max_consecutive_empty = max_consecutive_empty.max(current_consecutive_empty);
+            } else {
+                current_consecutive_empty = 0;
+            }
+        }
+        assert!(
+            max_consecutive_empty <= 1,
+            "Found excessive consecutive empty lines in tall terminal folded view: {max_consecutive_empty}"
+        );
+    }
+
+    #[test]
     fn agent_checkpoint_receipt_never_moves_the_body() {
         let mut s = state();
         s.resize(80, 24);
@@ -1928,7 +2198,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal.draw(|f| draw(f, &s)).unwrap();
         let before = terminal.backend().buffer().clone();
-        s.agent.receipt = Some("Checkpoint saved");
+        s.agent.receipt = Some("Checkpoint saved".into());
         s.agent.checkpoints = 1;
         terminal.draw(|f| draw(f, &s)).unwrap();
         let area = AgentLayout::new(s.viewport, s.config.text_width).body;
@@ -2081,5 +2351,59 @@ mod tests {
         assert_eq!(rendered[0].spans[0].style, palette.muted());
         // 第 1 行是新内容，样式应为 body
         assert_eq!(rendered[1].spans[0].style, palette.body());
+    }
+
+    #[test]
+    fn footer_renders_auto_reading_status_and_countdown() {
+        let mut s = state();
+        let palette = Palette::terminal();
+
+        // Initially inactive: no [Auto]
+        let normal_footer = reading_footer_line(&s, palette);
+        let normal_text: String = normal_footer
+            .spans
+            .into_iter()
+            .map(|sp| sp.content.into_owned())
+            .collect();
+        assert!(!normal_text.contains("[Auto"));
+
+        // Activate auto reading
+        s.update(crate::reader_state::ReaderAction::ToggleAutoReading);
+        let active_footer = reading_footer_line(&s, palette);
+        let active_text: String = active_footer
+            .spans
+            .into_iter()
+            .map(|sp| sp.content.into_owned())
+            .collect();
+        assert!(active_text.contains("[Auto: 300 CPM"));
+
+        // Pause auto reading
+        s.update(crate::reader_state::ReaderAction::ToggleAutoReadingPause);
+        let paused_footer = reading_footer_line(&s, palette);
+        let paused_text: String = paused_footer
+            .spans
+            .into_iter()
+            .map(|sp| sp.content.into_owned())
+            .collect();
+        assert!(paused_text.contains("[Auto: Paused · 300 CPM]"));
+
+        // Narrow terminal (width < 54): still renders exact CPM
+        s.viewport.width = 48;
+        let narrow_paused = reading_footer_line(&s, palette);
+        let narrow_paused_text: String = narrow_paused
+            .spans
+            .into_iter()
+            .map(|sp| sp.content.into_owned())
+            .collect();
+        assert!(narrow_paused_text.contains("300 CPM"));
+
+        // Agent mode: verify speed is rendered in agent terminal footer
+        s.viewport.width = 80;
+        s.config.discreet_mode = true;
+        s.update(crate::reader_state::ReaderAction::ToggleAutoReadingPause); // resume
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|frame| draw(frame, &s)).unwrap();
+        let term_screen = format!("{}", term.backend());
+        assert!(term_screen.contains("300 cpm"));
     }
 }

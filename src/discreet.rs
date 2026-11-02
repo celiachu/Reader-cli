@@ -2,6 +2,7 @@
 use crate::book::{Section, TextPosition};
 use crate::pagination::{wrap_text_with_layout, AnchoredLine};
 use ratatui::layout::Rect;
+use std::borrow::Cow;
 
 pub const DISCREET_ERROR_LINE: &str =
     "TypeError: Cannot read properties of undefined (reading 'profile')";
@@ -278,7 +279,7 @@ pub(crate) struct AgentSession {
     pub command: Option<String>,
     pub help: bool,
     pub help_offset: usize,
-    pub receipt: Option<&'static str>,
+    pub receipt: Option<Cow<'static, str>>,
     pub checkpoints: usize,
 }
 

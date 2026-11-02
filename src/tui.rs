@@ -142,6 +142,10 @@ fn run_reader_with_data(
             }
         }
 
+        if action.is_none() {
+            action = state.auto_reading_tick(now);
+        }
+
         let Some(action) = action else {
             continue;
         };
@@ -180,7 +184,7 @@ fn run_reader_with_data(
                     );
                 }
                 ReaderEffect::AddBookmark { label, progress } => {
-                    state.agent.receipt = Some("Checkpoint saving");
+                    state.agent.receipt = Some("Checkpoint saving".into());
                     enqueue(&writer, WriteCommand::Add { label, progress }, &mut state);
                 }
                 ReaderEffect::DeleteBookmark { id, removed, index } => {
@@ -190,7 +194,7 @@ fn run_reader_with_data(
                         if let Overlay::Bookmarks(navigator) = &mut state.overlay {
                             navigator.selection = insert_at;
                         }
-                        state.agent.receipt = Some("Save queue busy; retry the command");
+                        state.agent.receipt = Some("Save queue busy; retry the command".into());
                         if !state.hidden && !state.config.discreet_mode {
                             state.notify(
                                 "Save queue busy; retry the command",
@@ -231,7 +235,7 @@ fn run_reader_with_data(
 
 fn enqueue(writer: &ReaderWriter, command: WriteCommand, state: &mut ReaderState) {
     if !writer.enqueue(command) {
-        state.agent.receipt = Some("Save queue busy; retry the command");
+        state.agent.receipt = Some("Save queue busy; retry the command".into());
         if !state.hidden && !state.config.discreet_mode {
             state.notify(
                 "Save queue busy; retry the command",
@@ -255,7 +259,7 @@ fn apply_receipts(writer: &ReaderWriter, state: &mut ReaderState) {
         // Do not resurrect notifications after folding. Errors remain available
         // as a neutral status on restore, but never enter the safe renderer.
         if !state.hidden || receipt.error {
-            state.agent.receipt = Some(receipt.text);
+            state.agent.receipt = Some(receipt.text.into());
         }
         if !state.hidden && !state.config.discreet_mode {
             state.notify(
